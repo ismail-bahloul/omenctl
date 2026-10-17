@@ -263,8 +263,20 @@ def _color(on):
     return paint
 
 
+# Semantic colours from the 256-colour cube (>= 16), so a terminal theme cannot
+# remap them the way it remaps ANSI 30-37. The text markers (the `!` on a hot
+# die, the TUI legend) carry the same meaning without colour.
+GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE = (
+    "38;5;114", "38;5;221", "38;5;214", "38;5;203", "38;5;39", "38;5;111")
+
+
 def _temp_code(t):
-    return "32" if t < 60 else "33" if t < 75 else "38;5;208" if t < 85 else "31"
+    return GREEN if t < 60 else YELLOW if t < 75 else ORANGE if t < 85 else RED
+
+
+def _plain_paint(code, text):
+    """NO_COLOR / --no-color: same text, no ANSI (the TUI still uses attributes)."""
+    return text
 
 
 def _bar(frac, width, code, paint):
@@ -422,20 +434,20 @@ def render_power(p, bar_w, paint, width, level=0):
         hours = p["bat_wh"] / p["bat_w"]
         # fixed 0-60 W reading scale: the machine has no system power limit
         lines.append(_row("system", "%s %s%s" % (
-            _bar(p["bat_w"] / 60.0, bar_w, "33", paint), paint("1", "%4.1f W" % p["bat_w"]),
+            _bar(p["bat_w"] / 60.0, bar_w, YELLOW, paint), paint("1", "%4.1f W" % p["bat_w"]),
             paint("90", "  ~%dh%02d left" % (hours, (hours % 1) * 60))), paint))
     pkg = p["pkg_w"]
     lim = ra.get("STAPM LIMIT")
     if pkg is not None and lim:
         lines.append(_row("cpu pkg", "%s %s%s" % (
-            _bar(pkg / lim, bar_w, "35", paint),
+            _bar(pkg / lim, bar_w, PURPLE, paint),
             paint("1", "%4.1f" % pkg), paint("90", " / %g W" % lim)), paint))
     ghz = "%.2f GHz" % (p["fmax"] / 1e6) if p["fmax"] else "?"
-    boost = paint("32", "boost on") if p["boost"] else paint("33", "boost off")
+    boost = paint(GREEN, "boost on") if p["boost"] else paint(YELLOW, "boost off")
     if level < 2:
         lines.append(_row("cpu", "%s · max %s · %s" % (p["gov"], ghz, boost), paint))
     if ra and level == 0:
-        lines.append(_row("limits", paint("90", "slow %g · fast %g · apu %g · tctl %g °C" % (
+        lines.append(_row("limits", paint("90", "slow %g W · fast %g W · apu %g W · tctl %g °C" % (
             ra.get("PPT LIMIT SLOW", 0), ra.get("PPT LIMIT FAST", 0),
             ra.get("PPT LIMIT APU", 0), ra.get("THM LIMIT CORE", 0))), paint))
     d = {"nvidia": "nvidia (active)", "vfio-pci": "vfio-pci (off)"}.get(p["dgpu"], p["dgpu"])
@@ -456,30 +468,30 @@ def render_power(p, bar_w, paint, width, level=0):
         if p["bat_cap"] and level < 2:
             design, full = p["bat_cap"]
             health = 100.0 * full / design
-            code = "32" if health >= 80 else "33" if health >= 60 else "31"
+            code = GREEN if health >= 80 else YELLOW if health >= 60 else RED
             cycles = " · %d cycles" % p["bat_cycles"] if p["bat_cycles"] else ""
             lines.append(_row("health", "%s %s" % (
                 paint("1;" + code, "%.0f%%" % health),
                 paint("90", "(%.1f / %.1f Wh%s)" % (full, design, cycles))), paint))
         if p["bat_extender"] is not None and level == 0:
-            lines.append(_row("limit", paint("33", "adaptive extender on (BIOS caps the charge)")
+            lines.append(_row("limit", paint(YELLOW, "adaptive extender on (BIOS caps the charge)")
                               if p["bat_extender"] else paint("90", "adaptive extender off"),
                               paint))
     return lines
 
 
 def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, power, live,
-           manual=None, level=0, max_width=78):
+           manual=None, level=0, max_width=78, show_debug=True):
     """One frame of `status`, as a list of lines. `max_width` caps the layout (78
     keeps the plain view tidy; the TUI passes its full width); `level` trades detail
     for height: 0 everything, 1 no blank lines/footer/minor rows, 2 the essentials."""
     width = max(40, min(width, max_width)) - 2
-    bar_w = max(8, min(24 if max_width <= 78 else 60, width - 46))
+    bar_w = max(8, min(24 if max_width <= 78 else 30, width - 46))
     mode = current_mode(power).upper()
     src = "AC" if power["ac"] else "BATTERY"
     pad = max(1, width - len(" omenctl") - len(mode) - len(src) - 3)
     lines = [paint("1", " omenctl") + " " * pad
-             + paint("1;36", mode) + paint("90", " · ") + paint("1", src)]
+             + paint("1;" + BLUE, mode) + paint("90", " · ") + paint("1", src)]
     if level == 0:
         lines += ["", _section("Thermal", width, paint)]
     elif level == 1:
@@ -490,22 +502,29 @@ def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, pow
         temp = cpu if is_cpu else gpu
         setp = regs[o]
         label = "CPU" if is_cpu else "GPU"
-        head = "%s %s  " % (paint("1", label), paint("1;" + _temp_code(temp), "%4.0f°C" % temp))
+        warn = "!" if temp >= 85 else " "
+        head = "%s %s  " % (paint("1", label),
+                            paint("1;" + _temp_code(temp), "%4.0f°C%s" % (temp, warn)))
         if setp == RESET_VALUE:
-            fan = paint("33", "EC auto (not owned by omenctl)")
+            fan = paint(ORANGE, "EC auto (not owned by omenctl)")
         else:
             rpm = rpms[0 if is_cpu else 1]
-            fan = "%s %s %s" % (_bar(setp / f["speed_max"], bar_w, "36", paint),
-                                paint("1", "%3d%%" % setp),
-                                paint("90", "%5s rpm" % (rpm if rpm is not None else "?")))
+            fan_prefix = paint("90", "fan ") if max_width > 78 else ""
+            fan = "%s%s %s %s" % (fan_prefix,
+                                  _bar(setp / f["speed_max"], bar_w, BLUE, paint),
+                                  paint("1", "%3d%%" % setp),
+                                  paint("90", "%5s rpm" % (rpm if rpm is not None else "?")))
         if manual and f["write_reg"] in manual and setp != RESET_VALUE:
-            fan += paint("33", " manual")
+            fan += paint(ORANGE, " manual")
         # the graph takes whatever width is left after the gauge and the numbers
-        room = max(12, min(60, width - (bar_w + 35)))
+        extra = 4 if max_width > 78 else 0
+        room = max(12, width - (bar_w + 35 + extra))
         spark = _spark(hist[label][-room:], paint) if len(hist[label]) > 2 else ""
         lines.append("  " + head + fan + "  " + spark)
+    if max_width > 78 and level == 0:
+        lines.append(paint("90", "  bar = fan duty · spark = temperature history (30–100 °C)"))
     lines += render_power(power, bar_w, paint, width, level)
-    if level == 0:
+    if level == 0 and show_debug:
         foot = "ec57=%d ec49=%d (+%g)" % (ec57, gpu - gpu_offset, gpu_offset)
         lines += ["", paint("90", "  " + (foot + " · Ctrl-C to quit" if live else foot))]
     return lines
@@ -550,10 +569,10 @@ class Monitor:
                 "ec57": rig.ec_read(CPU_TEMP)[0],
                 "power": power_state(pm_limit_values(), rig, self.pkg.watts())}
 
-    def lines(self, d, width, paint, live, level=0, max_width=78):
+    def lines(self, d, width, paint, live, level=0, max_width=78, show_debug=True):
         return render(FANS, d["cpu"], d["gpu"], d["regs"], d["rpms"], self.hist, width,
                       paint, self.gpu_offset, d["ec57"], d["power"], live, d["manual"],
-                      level, max_width)
+                      level, max_width, show_debug)
 
 
 def state_json(d):
@@ -715,8 +734,11 @@ def tui_main(stdscr, args):
         curses.init_pair(n, n, -1)
         pairs[n] = n
     if curses.COLORS >= 256:
-        curses.init_pair(8, 208, -1)
-        pairs[208] = 8
+        # render() uses the 256-colour cube (>= 16) so the terminal theme cannot
+        # remap the semantics; register each code as a curses pair.
+        for i, code in enumerate((39, 111, 114, 221, 214, 203, 208), start=8):
+            curses.init_pair(i, code, -1)
+            pairs[code] = i
     curses.mouseinterval(0)                       # raw press/release, no click synthesis
     wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
     wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
@@ -730,7 +752,8 @@ def tui_main(stdscr, args):
     sys.stdout.flush()
     mon = Monitor(args.gpu_offset)
     syslog.openlog("omenctl-profile")
-    msg, sel = "", 0
+    paint = _plain_paint if os.environ.get("NO_COLOR") else _marker_paint
+    msg, sel, debug = "", 0, False
     TX = 24                                       # slider track column
     drag = None                                   # {"i": fan row, "val": %, "wrote": %, "t": s}
 
@@ -766,7 +789,7 @@ def tui_main(stdscr, args):
         # fit the view to the window: the most detailed level that leaves room for
         # the controls (buttons + 2 faders = 4 rows with their spacing, more when tall)
         for level in (0, 1, 2):
-            lines = mon.lines(d, w, _marker_paint, False, level, 400)
+            lines = mon.lines(d, w, paint, False, level, 400, debug)
             if len(lines) + 8 <= h or level == 2:
                 break
         room = h - len(lines)                         # rows left for the controls
@@ -783,8 +806,9 @@ def tui_main(stdscr, args):
         x, buttons = 2, []
         cur = d["power"]["mode"]
         owned = d["regs"][0] != RESET_VALUE
-        items = [(" %s %s " % (k, m), ("mode", m), m == cur) for k, m in TUI_MODES]
-        items.append((" f fans: %s " % ("omenctl" if owned else "EC"), ("fans", owned), False))
+        items = [("%s %s %s " % ("●" if m == cur else " ", k, m), ("mode", m), m == cur)
+                 for k, m in TUI_MODES]
+        items.append((" f %s fans " % ("stop" if owned else "start"), ("fans", owned), False))
         for label, action, active in items:
             if by < h and x + len(label) < w:
                 put(by, x, label, curses.A_REVERSE | curses.A_BOLD if active
@@ -821,9 +845,9 @@ def tui_main(stdscr, args):
             put(y, TX + tw + 1, "%3d%%" % value, curses.A_BOLD | dim)
             buttons.append((y, 13, 21, ("auto_toggle", i)))
             buttons.append((y, TX, TX + tw, ("track", i, TX, tw)))
-        hint = ("drag a fader · wheel or ←→ = 1 %  ·  [x] auto  ·  ↑↓ fan  a auto  ·  "
-                "1-4 modes  f fans  q quit" if w >= 90 else
-                "wheel/←→ 1 %  a auto  1-4 modes  f fans  q quit")
+        hint = ("drag/←→ 1 %  ·  a auto  ·  ↑/↓ fan  ·  1-4 mode  ·  f fans  ·  d debug  ·  q quit"
+                if w >= 90 else
+                "←→ 1 %  ·  a auto  ·  1-4 mode  ·  f fans  ·  d debug  ·  q quit")
         for yy, text, attr in ((my, msg, 0), (hy, hint, curses.A_DIM)):
             if yy < h and text:
                 put(yy, 2, text[:max(0, w - 3)], attr)
@@ -851,6 +875,9 @@ def tui_main(stdscr, args):
             msg = set_fan(d, sel, base + delta)
         elif key in (ord("a"), ord(" ")):
             action = ("auto_toggle", sel)
+        elif key == ord("d"):
+            debug = not debug
+            msg = "debug: %s" % ("on" if debug else "off")
         elif key == curses.KEY_MOUSE:
             try:
                 _id, mx, my, _z, bstate = curses.getmouse()

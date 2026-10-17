@@ -62,6 +62,15 @@ reboots and sleeps):
 - `eco`: the battery envelope kept on AC;
 - `perf`: everything unlocked.
 
+## TUI
+
+`sudo omenctl tui` shows the live view with the mode buttons and one fader per
+fan (mouse drag, wheel, or arrow keys). The wide bar is the fan duty and the
+sparkline on the right is the temperature history. A die at or above 85 °C is
+marked with `!`. Press `d` for the raw EC debug line, and set `NO_COLOR=1` to
+disable colour (the markers and labels remain). Keys: `1`-`4` mode, `↑`/`↓`
+fan, `a` auto, `f` start/stop the fan daemon, `q` quit.
+
 ## Safety contract
 
 - `255` on every exit path: clean stop, crash (via the supervisor wrapper),
@@ -78,11 +87,12 @@ reboots and sleeps):
 ## Tests
 
 ```sh
-python3 test_failpaths.py
+python3 test_failpaths.py    # safety/failure paths, simulated EC
+python3 test_render.py       # headless layout for status and the TUI
 ```
 
-No hardware and no root: the failure paths the safety contract depends on are
-simulated.
+No hardware and no root: the failure paths and the layout are exercised without
+the real machine.
 
 ## License
 
