@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax
+        run: python3 -m py_compile omenctl.py test_failpaths.py test_render.py
+      - name: Failure paths
+        run: python3 test_failpaths.py
+      - name: Layout, theme and curve
+        run: python3 test_render.py

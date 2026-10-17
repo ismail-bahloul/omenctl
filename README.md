@@ -1,5 +1,7 @@
 # omenctl
 
+[![test](https://github.com/ismail-bahloul/omenctl/actions/workflows/test.yml/badge.svg)](https://github.com/ismail-bahloul/omenctl/actions/workflows/test.yml)
+
 Fans and power modes for the **HP OMEN Laptop 15-en1xxx** (Ryzen 7 5800H,
 RTX 3070; verified on DMI board `88D2`), as one small tool. It replaces
 `nbfc_service` and the `power-profile*` scripts.
