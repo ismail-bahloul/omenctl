@@ -325,6 +325,39 @@ def curve_current_index(thr, temp):
     return idx
 
 
+def curve_duty_at(thr, temp):
+    """The duty the curve asks for at `temp` (up thresholds, no hysteresis)."""
+    idx = curve_current_index(thr, temp)
+    return thr[idx][2] if idx is not None and thr else 0
+
+
+def curve_graph(thr, width=40, height=8, tmin=30, tmax=100):
+    """Temperature -> duty area chart as `height` rows of `width` cells.
+
+    The area under the curve is filled from the bottom in eighths of a cell,
+    so 8 * height duty levels fit. Returns (rows, codes): `codes[y][x]` is the
+    severity colour of that column's temperature, or None for the empty part.
+    The curve editor paints the cells; this function stays pure and testable.
+    """
+    if not thr or width < 2 or height < 1 or tmax <= tmin:
+        return [], []
+    rows = [["·"] * width for _ in range(height)]
+    codes = [[None] * width for _ in range(height)]
+    for x in range(width):
+        temp = tmin + (tmax - tmin) * x / (width - 1)
+        duty = curve_duty_at(thr, temp)
+        eighths = int(round(duty / 100.0 * height * 8))
+        code = _temp_code(temp)
+        for yb in range(height):                 # yb: rows from the bottom
+            fill = max(0, min(8, eighths - yb * 8))
+            if not fill:
+                break
+            y = height - 1 - yb
+            rows[y][x] = "█" if fill == 8 else SPARK[fill - 1]
+            codes[y][x] = code
+    return rows, codes
+
+
 # ---------------------------------------------------------------- commands --
 
 def cmd_reset(args):
@@ -1319,6 +1352,22 @@ def curve_main(stdscr, fan_key):
                 x = 10 + c * 9
                 text = "%4d %%" % value if c == 2 else "%4d" % value
                 put(y, x, text, attr | (curses.A_REVERSE if selected and c == col else 0))
+        gx, gw = 40, w - 42
+        gh = min(len(thr), h - 12)
+        if gw >= 24 and gh >= 4:
+            rows, codes = curve_graph(thr, gw, gh)
+            put(2, gx, "duty % by °C", curses.A_DIM)
+            for gy, (grow, gcode) in enumerate(zip(rows, codes)):
+                for gxx, (ch, code) in enumerate(zip(grow, gcode)):
+                    put(4 + gy, gx + gxx, ch, code_attr(code) if code else curses.A_DIM)
+            put(4 + gh, gx, "30°C", curses.A_DIM)
+            put(4 + gh, gx + gw - 4, "100°C", curses.A_DIM)
+            if temp is not None and 30 <= temp <= 100:
+                mx = int(round((temp - 30) / 70.0 * (gw - 1)))
+                put(3, gx + mx, "▼", curses.A_BOLD | code_attr(_temp_code(temp)))
+                for gy in range(gh):
+                    if rows[gy][mx] in ("·", " "):
+                        put(4 + gy, gx + mx, "│", curses.A_DIM)
         y = 4 + len(thr) + 1
         if temp is None:
             put(y, 2, "temperature unavailable", code_attr(ORANGE))

@@ -85,6 +85,9 @@ without the file the embedded table is used. Keys: `↑`/`↓` step, `Tab` colum
 `←`/`→` ±1, `PgUp`/`PgDn` ±5, `1`/`2` fan, `s` save, `r` reset, `q` quit.
 Validation keeps `up` increasing, `down` below `up`, and duty non-decreasing;
 an invalid file is ignored and the previous curve stays.
+The editor draws the curve live on the right: temperature on the x axis, duty on
+the y axis, coloured by the usual severity palette, with a marker on the current
+temperature. A step's effect is visible before saving.
 
 ## Safety contract
 

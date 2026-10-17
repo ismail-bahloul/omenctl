@@ -108,6 +108,27 @@ def curve_test():
     print("PASS  curve validation and save/load")
 
 
+def graph_test():
+    """The curve editor's temperature -> duty graph."""
+    thr = oc.FANS[0]["thr"]
+    assert oc.curve_duty_at(thr, 30) == 12
+    assert oc.curve_duty_at(thr, 65) == 20
+    assert oc.curve_duty_at(thr, 100) == 100
+    assert oc.curve_duty_at(thr, None) == 0
+
+    rows, codes = oc.curve_graph(thr, 40, 8)
+    assert len(rows) == len(codes) == 8
+    assert all(len(r) == 40 and len(c) == 40 for r, c in zip(rows, codes))
+    assert set("".join("".join(r) for r in rows)) <= set(oc.SPARK + "·█")
+    duties = [oc.curve_duty_at(thr, 30 + 70 * x / 39) for x in range(40)]
+    assert duties == sorted(duties), "graph must not go down with temperature"
+    assert rows[-1][0] != "·" and rows[-1][-1] != "·", "area missing"
+    assert all(code is None for code in codes[0][:10]), "duty 12% should not reach the top"
+    assert oc.curve_graph([], 40, 8) == ([], [])
+    assert oc.curve_graph(thr, 1, 8) == ([], [])
+    print("PASS  curve graph (shape, monotonic duty, severity codes)")
+
+
 def main():
     checks = 0
     for width in (40, 60, 78, 92, 120, 160):
@@ -139,6 +160,7 @@ def main():
     print("PASS  hot-die marker, fan label, legend, debug toggle")
     theme_test()
     curve_test()
+    graph_test()
     return 0
 
 
