@@ -808,7 +808,7 @@ class Monitor:
         self.pkg = PkgPower()
         self.hist = {"CPU": [], "GPU": []}
 
-    def sample(self):
+    def sample(self, pkg_settle=0.3):
         rig = self.rig
         cpu, gpu, regs = rig.temps()
         for label, t in (("CPU", cpu), ("GPU", gpu)):
@@ -817,7 +817,7 @@ class Monitor:
         return {"cpu": cpu, "gpu": gpu, "regs": regs, "rpms": rpms,
                 "manual": overrides_read(),
                 "ec57": rig.ec_read(CPU_TEMP)[0],
-                "power": power_state(pm_limit_values(), rig, self.pkg.watts())}
+                "power": power_state(pm_limit_values(), rig, self.pkg.watts(settle=pkg_settle))}
 
     def lines(self, d, width, paint, live, level=0, max_width=78, show_debug=True):
         return render(FANS, d["cpu"], d["gpu"], d["regs"], d["rpms"], self.hist, width,
@@ -1015,6 +1015,17 @@ def tui_main(stdscr, args):
     # while a button is held"; cmd_tui turns it off again on the way out.
     sys.stdout.write("\x1b[?1002h")
     sys.stdout.flush()
+    # The RAPL power meter averages over 0.3 s on its first call; that is useful
+    # for `status` but would leave the TUI blank. Draw something first, then take
+    # the first sample without the settle (the next one, one second later, is
+    # accurate).
+    stdscr.erase()
+    try:
+        stdscr.addstr(0, 1, " omenctl", curses.A_BOLD)
+        stdscr.addstr(2, 2, "reading sensors…", curses.A_DIM)
+    except curses.error:
+        pass
+    stdscr.refresh()
     mon = Monitor(args.gpu_offset)
     syslog.openlog("omenctl-profile")
     paint = _plain_paint if os.environ.get("NO_COLOR") else _marker_paint
@@ -1045,7 +1056,7 @@ def tui_main(stdscr, args):
         return max(OVERRIDE_MIN, min(100, round((mx - x0) / float(max(1, tw - 1))
                                                 * (100 - OVERRIDE_MIN)) + OVERRIDE_MIN))
 
-    d = mon.sample()
+    d = mon.sample(pkg_settle=0.0)
     next_sample = time.monotonic() + SAMPLE_EVERY
     while True:
         d["manual"] = overrides_read()                # cheap, and always current
