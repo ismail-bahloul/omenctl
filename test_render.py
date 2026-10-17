@@ -43,33 +43,43 @@ def render(width, level, max_width, show_debug, no_color):
 
 
 def theme_test():
-    """The KDE Material You roles map to the expected 256-colour indices."""
+    """Hybrid theme: severity from KDE, accents from Konsole."""
     import tempfile
-    scheme = """[Colors:View]
+    kde = """[Colors:View]
 ForegroundPositive=#31C193
 ForegroundNeutral=#FF734A
 ForegroundNegative=#FF6A9D
-ForegroundLink=#6F9FE7
-DecorationFocus=#d1bfeb
 """
-    fd, path = tempfile.mkstemp(suffix=".colors")
+    konsole = """[Color1]
+Color=146,159,235
+
+[Color3]
+Color=185,159,234
+"""
+    fd, kde_path = tempfile.mkstemp(suffix=".colors")
     with os.fdopen(fd, "w") as f:
-        f.write(scheme)
+        f.write(kde)
+    fd, konsole_path = tempfile.mkstemp(suffix=".colorscheme")
+    with os.fdopen(fd, "w") as f:
+        f.write(konsole)
     old = (oc.GREEN, oc.YELLOW, oc.ORANGE, oc.RED, oc.BLUE, oc.PURPLE)
-    os.environ["OMENCTL_THEME"] = path
+    os.environ["OMENCTL_THEME"] = kde_path
+    os.environ["OMENCTL_KONSOLE_THEME"] = konsole_path
     try:
         oc.load_theme()
         assert oc.GREEN == "38;5;72", oc.GREEN
         assert oc.ORANGE == "38;5;203", oc.ORANGE
         assert oc.RED == "38;5;205", oc.RED
-        assert oc.BLUE == "38;5;74", oc.BLUE
-        assert oc.PURPLE == "38;5;182", oc.PURPLE
-        assert oc.YELLOW.startswith("38;5;"), oc.YELLOW
+        assert oc.YELLOW == "38;5;101", oc.YELLOW
+        assert oc.BLUE == "38;5;110", oc.BLUE
+        assert oc.PURPLE == "38;5;146", oc.PURPLE
     finally:
         os.environ.pop("OMENCTL_THEME", None)
+        os.environ.pop("OMENCTL_KONSOLE_THEME", None)
         oc.GREEN, oc.YELLOW, oc.ORANGE, oc.RED, oc.BLUE, oc.PURPLE = old
-        os.unlink(path)
-    print("PASS  Material You semantic roles")
+        os.unlink(kde_path)
+        os.unlink(konsole_path)
+    print("PASS  Material You theme (KDE severity + Konsole accents)")
 
 
 def main():

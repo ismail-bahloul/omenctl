@@ -298,11 +298,7 @@ def _mix_hex(a, b, t):
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(av, bv))
 
 
-def _theme_path():
-    """The KDE colour scheme Material You generated, or None."""
-    env = os.environ.get("OMENCTL_THEME")
-    if env:
-        return None if env.lower() in ("none", "off", "0") else env
+def _user_home():
     home = os.path.expanduser("~")
     user = os.environ.get("SUDO_USER")
     if user:
@@ -311,6 +307,15 @@ def _theme_path():
             home = pwd.getpwnam(user).pw_dir
         except KeyError:
             pass
+    return home
+
+
+def _theme_path():
+    """The KDE colour scheme Material You generated, or None."""
+    env = os.environ.get("OMENCTL_THEME")
+    if env:
+        return None if env.lower() in ("none", "off", "0") else env
+    home = _user_home()
     import configparser
     name = None
     try:
@@ -332,48 +337,85 @@ def _theme_path():
     return None
 
 
-def load_theme():
-    """Use the KDE Material You semantic roles for the TUI colours.
+def _konsole_theme_path():
+    """The Konsole scheme used by Zed/btop/kitty/prompt, or None."""
+    env = os.environ.get("OMENCTL_KONSOLE_THEME")
+    if env:
+        return None if env.lower() in ("none", "off", "0") else env
+    home = _user_home()
+    for name in ("MaterialYou.colorscheme", "MaterialYouAlt.colorscheme"):
+        path = os.path.join(home, ".local", "share", "konsole", name)
+        if os.path.exists(path):
+            return path
+    return None
 
-    The Konsole 16-colour scheme is all accent hues (its Color1 is blue, not
-    red), so severity must come from the KDE roles: Positive is the green,
-    Neutral the orange, Negative the red/pink, Link the accent blue and
-    DecorationFocus the purple. Missing roles keep the fixed palette.
-    """
-    global GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE
-    path = _theme_path()
-    if not path:
-        return
+
+def _konsole_color(path, section):
     import configparser
     c = configparser.ConfigParser()
     try:
         c.read(path)
+        raw = c.get(section, "Color", fallback=None)
     except (OSError, configparser.Error):
-        return
-
-    def role(key):
-        for section in ("Colors:View", "Colors:Button", "Colors:Window"):
-            if c.has_section(section) and c.has_option(section, key):
-                return c.get(section, key)
         return None
+    if not raw:
+        return None
+    try:
+        r, g, b = [int(x) for x in raw.split(",")]
+    except ValueError:
+        return None
+    return "#%02x%02x%02x" % (r, g, b)
 
-    pos = role("ForegroundPositive")
-    neu = role("ForegroundNeutral")
-    neg = role("ForegroundNegative")
-    link = role("ForegroundLink")
-    focus = role("DecorationFocus")
-    if pos:
-        GREEN = "38;5;%d" % _hex_256(pos)
-    if neu:
-        ORANGE = "38;5;%d" % _hex_256(neu)
-    if neg:
-        RED = "38;5;%d" % _hex_256(neg)
-    if link:
-        BLUE = "38;5;%d" % _hex_256(link)
-    if focus:
-        PURPLE = "38;5;%d" % _hex_256(focus)
-    if pos and neu:
-        YELLOW = "38;5;%d" % _hex_256(_mix_hex(pos, neu, 0.5))
+
+def load_theme():
+    """Material You colours: severity from KDE, accents from Konsole.
+
+    Zed, btop, kitty and the prompt all derive from the Konsole scheme
+    (MaterialYou.colorscheme) via material_you_lib; fastfetch uses the
+    terminal's ANSI palette, i.e. the same source. That scheme is all accent
+    hues -- its Color1 is blue, there is no red or green -- so it cannot carry
+    temperature severity. The KDE scheme (MaterialYouDark.colors) has the
+    semantic roles: Positive is the green, Neutral the orange, Negative the
+    red/pink. Use those for severity and the Konsole accents for the chrome, so
+    the TUI matches the terminal and stays honest about a hot die.
+    """
+    global GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE
+
+    path = _theme_path()
+    if path:
+        import configparser
+        c = configparser.ConfigParser()
+        try:
+            c.read(path)
+        except (OSError, configparser.Error):
+            c = None
+        if c is not None:
+            def role(key):
+                for section in ("Colors:View", "Colors:Button", "Colors:Window"):
+                    if c.has_section(section) and c.has_option(section, key):
+                        return c.get(section, key)
+                return None
+
+            pos = role("ForegroundPositive")
+            neu = role("ForegroundNeutral")
+            neg = role("ForegroundNegative")
+            if pos:
+                GREEN = "38;5;%d" % _hex_256(pos)
+            if neu:
+                ORANGE = "38;5;%d" % _hex_256(neu)
+            if neg:
+                RED = "38;5;%d" % _hex_256(neg)
+            if pos and neu:
+                YELLOW = "38;5;%d" % _hex_256(_mix_hex(pos, neu, 0.5))
+
+    kpath = _konsole_theme_path()
+    if kpath:
+        accent = _konsole_color(kpath, "Color1") or _konsole_color(kpath, "Color1Intense")
+        accent2 = _konsole_color(kpath, "Color3") or _konsole_color(kpath, "Color3Intense")
+        if accent:
+            BLUE = "38;5;%d" % _hex_256(accent)
+        if accent2:
+            PURPLE = "38;5;%d" % _hex_256(accent2)
 
 
 def _temp_code(t):
