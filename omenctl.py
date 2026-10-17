@@ -41,6 +41,7 @@ once.
 import argparse
 import fcntl
 import glob
+import json
 import os
 import signal
 import socket
@@ -64,6 +65,7 @@ LOW_SPEED = 12             # ...but below this (the curve's lowest step) it is o
 LOW_SPEED_MAX_TEMP = 65.0  # trusted up to this temperature (C)
 OVERRIDE_MAX_TEMP = 80.0   # any manual speed is dropped for a fan this hot (C)
 FAN_KEYS = {"cpu": SET_CPU, "gpu": SET_GPU}
+CURVE_FILE = os.environ.get("OMENCTL_CURVE_FILE", "/etc/omenctl/fans.json")
 
 stop = False
 
@@ -119,6 +121,10 @@ FANS = [
              (79, 71, 35), (83, 76, 45), (87, 80, 55), (91, 85, 65), (94, 89, 80),
              (100, 92, 100)]},
 ]
+
+# The embedded defaults, before any /etc/omenctl/fans.json override. The TUI
+# editor's `r` restores one of these.
+DEFAULT_THR = [[tuple(x) for x in f["thr"]] for f in FANS]
 
 
 def overrides_read():
@@ -221,6 +227,102 @@ class Rig:
 
 def fan_temp(fan, cpu, gpu):
     return cpu if fan["write_reg"] == SET_CPU else gpu
+
+
+# --------------------------------------------------------------- fan curve --
+
+def curve_error(thr):
+    """Why `thr` is not a valid curve, or None. The rules keep the nbfc
+    hysteresis shape: up strictly increases, down sits between the previous
+    step's down and up, and duty never decreases with temperature."""
+    if not thr:
+        return "curve is empty"
+    prev_up = prev_down = prev_duty = -1
+    for i, row in enumerate(thr):
+        try:
+            up, down, duty = row
+        except (TypeError, ValueError):
+            return "step %d: bad row" % (i + 1)
+        if not (0 <= down < up <= 120):
+            return "step %d: need 0 <= down < up <= 120" % (i + 1)
+        if up <= prev_up:
+            return "step %d: up must increase" % (i + 1)
+        if i and down < prev_down:
+            return "step %d: down must not decrease" % (i + 1)
+        if i and down > prev_up:
+            return "step %d: down must stay below the previous up" % (i + 1)
+        if not (0 <= duty <= 100):
+            return "step %d: duty must be 0-100" % (i + 1)
+        if duty < prev_duty:
+            return "step %d: duty must not decrease" % (i + 1)
+        prev_up, prev_down, prev_duty = up, down, duty
+    return None
+
+
+def curve_data():
+    return {"version": 1,
+            "cpu": [list(x) for x in FANS[0]["thr"]],
+            "gpu": [list(x) for x in FANS[1]["thr"]]}
+
+
+def load_curve_file():
+    """Apply /etc/omenctl/fans.json to FANS. False on missing/invalid."""
+    try:
+        with open(CURVE_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    try:
+        curves = []
+        for key in ("cpu", "gpu"):
+            thr = [(int(a), int(b), int(c)) for a, b, c in data[key]]
+            if curve_error(thr):
+                return False
+            curves.append(thr)
+    except (KeyError, TypeError, ValueError):
+        return False
+    for i, thr in enumerate(curves):
+        FANS[i]["thr"] = thr
+    return True
+
+
+def save_curve_file():
+    """Validate both curves and replace the file atomically. None on success."""
+    for key, fan in zip(("cpu", "gpu"), FANS):
+        err = curve_error(fan["thr"])
+        if err:
+            return "%s: %s" % (key, err)
+    try:
+        directory = os.path.dirname(CURVE_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = CURVE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(curve_data(), f, indent=2)
+            f.write("\n")
+        os.replace(tmp, CURVE_FILE)
+    except OSError as e:
+        return "cannot write %s: %s" % (CURVE_FILE, e)
+    return None
+
+
+def curve_mtime():
+    try:
+        return os.stat(CURVE_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
+def curve_current_index(thr, temp):
+    """The step the temperature falls in. The daemon's hysteresis state can
+    differ by one; the editor labels this as the temperature step."""
+    if temp is None:
+        return None
+    idx = 0
+    for i, row in enumerate(thr):
+        if temp >= row[0]:
+            idx = i
+    return idx
 
 
 # ---------------------------------------------------------------- commands --
@@ -871,21 +973,14 @@ SAMPLE_EVERY = 1.0          # s -- hardware is read at this pace; drawing follow
 DRAG_WRITE_EVERY = 0.04     # s -- at most ~25 file writes/s while a fader is dragged
 
 
-def tui_main(stdscr, args):
-    import contextlib
+def init_pairs():
+    """Initialise the curses colour pairs from the theme roles (load_theme first)."""
     import curses
-    import io
-    curses.set_escdelay(25)          # ms ncurses waits to tell Esc from an escape sequence
-    curses.curs_set(0)
-    curses.use_default_colors()
-    load_theme()
     pairs = {}
     for n in range(1, 8):
         curses.init_pair(n, n, -1)
         pairs[n] = n
     if curses.COLORS >= 256:
-        # render() uses the 256-colour cube (>= 16); register the semantic
-        # roles actually in use (load_theme() may have replaced them).
         codes = set()
         for code in (GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE):
             if code.startswith("38;5;"):
@@ -897,6 +992,18 @@ def tui_main(stdscr, args):
             if code < curses.COLORS:
                 curses.init_pair(i, code, -1)
                 pairs[code] = i
+    return pairs
+
+
+def tui_main(stdscr, args):
+    import contextlib
+    import curses
+    import io
+    curses.set_escdelay(25)          # ms ncurses waits to tell Esc from an escape sequence
+    curses.curs_set(0)
+    curses.use_default_colors()
+    load_theme()
+    pairs = init_pairs()
     curses.mouseinterval(0)                       # raw press/release, no click synthesis
     wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
     wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
@@ -1003,9 +1110,9 @@ def tui_main(stdscr, args):
             put(y, TX + tw + 1, "%3d%%" % value, curses.A_BOLD | dim)
             buttons.append((y, 13, 21, ("auto_toggle", i)))
             buttons.append((y, TX, TX + tw, ("track", i, TX, tw)))
-        hint = ("drag/←→ 1 %  ·  a auto  ·  ↑/↓ fan  ·  1-4 mode  ·  f fans  ·  d debug  ·  q quit"
+        hint = ("drag/←→ 1 % · a auto · ↑/↓ fan · 1-4 mode · c curve · f fans · d debug · q quit"
                 if w >= 90 else
-                "←→ 1 %  ·  a auto  ·  1-4 mode  ·  f fans  ·  d debug  ·  q quit")
+                "←→ 1 % · a auto · 1-4 mode · c curve · f fans · d debug · q quit")
         for yy, text, attr in ((my, msg, 0), (hy, hint, curses.A_DIM)):
             if yy < h and text:
                 put(yy, 2, text[:max(0, w - 3)], attr)
@@ -1033,6 +1140,19 @@ def tui_main(stdscr, args):
             msg = set_fan(d, sel, base + delta)
         elif key in (ord("a"), ord(" ")):
             action = ("auto_toggle", sel)
+        elif key == ord("c"):
+            curses.def_prog_mode()
+            curses.endwin()
+            try:
+                subprocess.run([sys.executable, os.path.abspath(__file__), "curve",
+                                "cpu" if sel == 0 else "gpu"], check=False)
+            finally:
+                curses.reset_prog_mode()
+                stdscr.clear()
+                stdscr.refresh()
+            d = mon.sample()
+            next_sample = time.monotonic() + SAMPLE_EVERY
+            msg = "curve editor closed"
         elif key == ord("d"):
             debug = not debug
             msg = "debug: %s" % ("on" if debug else "off")
@@ -1094,6 +1214,177 @@ def tui_main(stdscr, args):
                 msg = set_fan(d, sel, d["regs"][FAN_ROWS[sel][3]])
             else:
                 msg = set_fan(d, sel, None)
+
+
+CURVE_COLS = ("up", "down", "duty")
+
+
+def curve_main(stdscr, fan_key):
+    """Edit one fan curve; the daemon reloads /etc/omenctl/fans.json on mtime."""
+    import curses
+    curses.set_escdelay(25)
+    curses.curs_set(0)
+    curses.use_default_colors()
+    load_theme()
+    pairs = init_pairs()
+    load_curve_file()
+
+    fan = 0 if fan_key == "cpu" else 1
+    row = col = 0
+    dirty = confirm_quit = False
+    msg = ""
+    rig = None
+    try:
+        rig = Rig(3.0)
+    except OSError:
+        pass
+    cpu = gpu = None
+
+    def put(y, x, text, attr=0):
+        try:
+            stdscr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def code_attr(code):
+        if isinstance(code, str) and code.startswith("38;5;"):
+            try:
+                return curses.color_pair(pairs.get(int(code.rsplit(";", 1)[1]), pairs[3]))
+            except ValueError:
+                pass
+        return 0
+
+    def sample():
+        nonlocal cpu, gpu
+        if rig is None:
+            return
+        try:
+            cpu, gpu, _ = rig.temps()
+        except OSError:
+            cpu = gpu = None
+
+    def bump(delta):
+        nonlocal dirty, confirm_quit
+        thr = FANS[fan]["thr"]
+        if not thr:
+            return
+        value = list(thr[row])
+        if col == 0:                       # up
+            value[0] = max(value[1] + 1, min(120, value[0] + delta))
+        elif col == 1:                     # down
+            value[1] = max(0, min(value[0] - 1, value[1] + delta))
+        else:                              # duty
+            value[2] = max(0, min(100, value[2] + delta))
+        thr[row] = tuple(value)
+        dirty = True
+        confirm_quit = False
+
+    sample()
+    while True:
+        thr = FANS[fan]["thr"]
+        err = curve_error(thr)
+        temp = cpu if fan == 0 else gpu
+        cur = curve_current_index(thr, temp)
+
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        put(0, 1, " omenctl curve", curses.A_BOLD)
+        title = FANS[fan]["name"]
+        put(0, max(0, w - len(title) - 2), title + " ", curses.A_BOLD)
+        put(2, 2, "──── curve ────", curses.A_DIM)
+        put(3, 4, "#", curses.A_DIM)
+        put(3, 10, "up °C", curses.A_DIM)
+        put(3, 19, "down °C", curses.A_DIM)
+        put(3, 28, "duty", curses.A_DIM)
+        for i, (up, down, duty) in enumerate(thr):
+            y = 4 + i
+            if y >= h - 3:
+                break
+            selected = i == row
+            attr = curses.A_BOLD if selected else 0
+            put(y, 2, "▸" if selected else " ", code_attr(GREEN if i == cur else 0) | attr)
+            put(y, 4, "%3d" % (i + 1), attr)
+            for c, value in enumerate((up, down, duty)):
+                x = 10 + c * 9
+                text = "%4d %%" % value if c == 2 else "%4d" % value
+                put(y, x, text, attr | (curses.A_REVERSE if selected and c == col else 0))
+        y = 4 + len(thr) + 1
+        if temp is None:
+            put(y, 2, "temperature unavailable", code_attr(ORANGE))
+        else:
+            put(y, 2, "temp %3.0f °C → step %d (%d %%)"
+                % (temp, (cur or 0) + 1, thr[cur][2] if cur is not None else 0),
+                code_attr(_temp_code(temp)))
+            if cur is not None and cur + 1 < len(thr):
+                nxt = thr[cur + 1]
+                put(y + 1, 2, "next %3d °C → %d %%" % (nxt[0], nxt[2]), curses.A_DIM)
+        if err:
+            put(y + 2, 2, "invalid: " + err, code_attr(RED))
+        if msg:
+            put(y + 3, 2, msg[:max(0, w - 3)])
+        hint = ("↑/↓ step · Tab column · ←/→ 1 · PgUp/PgDn 5 · 1/2 fan · "
+                "s save · r reset · q quit")
+        put(h - 1, 2, hint[:max(0, w - 3)], curses.A_DIM)
+        stdscr.refresh()
+
+        stdscr.timeout(1000)
+        key = stdscr.getch()
+        if key == -1:
+            sample()
+            continue
+        if key in (ord("q"), 27):
+            if dirty and not confirm_quit:
+                msg = "unsaved curve: s save · Q quit anyway"
+                confirm_quit = True
+                continue
+            break
+        if key == ord("Q"):
+            break
+        if key == ord("s"):
+            err = save_curve_file()
+            if err:
+                msg = err
+            else:
+                dirty = confirm_quit = False
+                msg = "saved; the daemon reloads within 1 s"
+            continue
+        if key == ord("r"):
+            FANS[fan]["thr"] = [tuple(x) for x in DEFAULT_THR[fan]]
+            row = col = 0
+            dirty = True
+            confirm_quit = False
+            msg = "reset to the embedded defaults (s to save)"
+            continue
+        if key in (ord("1"), ord("2")):
+            fan = key - ord("1")
+            row = col = 0
+            msg = FANS[fan]["name"]
+            continue
+        if key == curses.KEY_UP:
+            row = max(0, row - 1)
+        elif key == curses.KEY_DOWN:
+            row = min(len(thr) - 1, row + 1)
+        elif key == 9:                     # Tab
+            col = (col + 1) % 3
+        elif key == curses.KEY_BTAB:
+            col = (col - 1) % 3
+        elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            bump(-1 if key == curses.KEY_LEFT else 1)
+        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            bump(-5 if key == curses.KEY_PPAGE else 5)
+    if rig is not None:
+        rig.close()
+    return 0
+
+
+def cmd_curve(args):
+    import curses
+    if not sys.stdout.isatty():
+        sys.exit("omenctl curve needs a terminal")
+    try:
+        return curses.wrapper(curve_main, args.fan) or 0
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_tui(args):
@@ -1496,7 +1787,9 @@ def cmd_run(args):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     rig = Rig(args.gpu_offset, writable=True)
+    load_curve_file()
     fans = FANS
+    curve_stamp = curve_mtime()
 
     regs = rig.ec_read(SET_CPU, 4)
     idx = {f["write_reg"]: initial_index(f["thr"], regs[f["write_reg"] - SET_CPU + 2])
@@ -1529,6 +1822,18 @@ def cmd_run(args):
                         pass
             time.sleep(1)
             continue
+
+        stamp = curve_mtime()
+        if stamp != curve_stamp:
+            if load_curve_file():
+                for f in fans:
+                    wr = f["write_reg"]
+                    idx[wr] = min(idx.get(wr, 0), len(f["thr"]) - 1)
+                print("run: curve reloaded from %s" % CURVE_FILE, flush=True)
+            else:
+                print("run: ignoring invalid or missing %s (keeping the old curve)"
+                      % CURVE_FILE, flush=True)
+            curve_stamp = stamp
 
         critical = cpu >= CRITICAL_TEMP or gpu >= CRITICAL_TEMP
         manual = overrides_read()
@@ -1624,6 +1929,10 @@ def main():
     p = sub.add_parser("tui", help="live terminal UI: modes as buttons (mouse or keys)")
     p.add_argument("--gpu-offset", type=float, default=3.0, help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_tui)
+
+    p = sub.add_parser("curve", help="edit the fan curve: curve cpu|gpu")
+    p.add_argument("fan", nargs="?", default="cpu", choices=["cpu", "gpu"])
+    p.set_defaults(func=cmd_curve)
 
     p = sub.add_parser("profile", formatter_class=argparse.RawDescriptionHelpFormatter,
                        help="apply a CPU/GPU power profile", description=PROFILE_HELP)

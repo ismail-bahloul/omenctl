@@ -82,6 +82,32 @@ Color=185,159,234
     print("PASS  Material You theme (KDE severity + Konsole accents)")
 
 
+def curve_test():
+    """Curve validation and the save/load round-trip."""
+    import tempfile
+    old_file = oc.CURVE_FILE
+    old_thr = [list(f["thr"]) for f in oc.FANS]
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    oc.CURVE_FILE = path
+    try:
+        assert oc.curve_error(oc.FANS[0]["thr"]) is None
+        assert "up must increase" in oc.curve_error([(50, 0, 12), (50, 49, 16)])
+        assert "duty must not decrease" in oc.curve_error([(50, 0, 12), (60, 49, 10)])
+        assert oc.save_curve_file() is None
+        oc.FANS[0]["thr"] = [(40, 0, 10)]
+        oc.FANS[1]["thr"] = [(40, 0, 10)]
+        assert oc.load_curve_file()
+        assert len(oc.FANS[0]["thr"]) == len(old_thr[0])
+        assert len(oc.FANS[1]["thr"]) == len(old_thr[1])
+    finally:
+        oc.CURVE_FILE = old_file
+        for i, thr in enumerate(old_thr):
+            oc.FANS[i]["thr"] = thr
+        os.unlink(path)
+    print("PASS  curve validation and save/load")
+
+
 def main():
     checks = 0
     for width in (40, 60, 78, 92, 120, 160):
@@ -112,6 +138,7 @@ def main():
     print("PASS  %d layout combinations" % checks)
     print("PASS  hot-die marker, fan label, legend, debug toggle")
     theme_test()
+    curve_test()
     return 0
 
 

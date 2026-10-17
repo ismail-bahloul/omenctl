@@ -75,6 +75,15 @@ come from the Konsole scheme, the same source as Zed/btop/kitty/fastfetch.
 one; set either to `none` to disable it. Keys: `1`-`4` mode,
 `↑`/`↓` fan, `a` auto, `f` start/stop the fan daemon, `q` quit.
 
+## Fan curve
+
+`sudo omenctl curve cpu|gpu` edits the curve (or press `c` in the TUI). It is
+saved to `/etc/omenctl/fans.json` and the daemon reloads it within a second;
+without the file the embedded table is used. Keys: `↑`/`↓` step, `Tab` column,
+`←`/`→` ±1, `PgUp`/`PgDn` ±5, `1`/`2` fan, `s` save, `r` reset, `q` quit.
+Validation keeps `up` increasing, `down` below `up`, and duty non-decreasing;
+an invalid file is ignored and the previous curve stays.
+
 ## Safety contract
 
 - `255` on every exit path: clean stop, crash (via the supervisor wrapper),
