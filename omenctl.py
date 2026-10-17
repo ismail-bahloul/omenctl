@@ -43,6 +43,7 @@ import fcntl
 import glob
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -562,6 +563,15 @@ def _plain_paint(code, text):
     return text
 
 
+_MARKER_RE = re.compile(r"\x01[^\x02]*\x02(.*?)\x03")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _vislen(text):
+    """Display width of a painted string: markers and ANSI escapes excluded."""
+    return len(_ANSI_RE.sub("", _MARKER_RE.sub(r"\1", text)))
+
+
 def _bar(frac, width, code, paint):
     """A gauge `width` cells wide, filled in eighths of a cell."""
     eighths = max(0, min(width * 8, round(frac * width * 8)))
@@ -699,18 +709,22 @@ def power_state(ra, rig, pkg_w):
 
 
 def _section(title, width, paint):
-    return paint("90", "─ ") + paint("1", title) + " " + paint("90", "─" * max(4, width - len(title) - 4))
+    return (paint("90", "─ ") + paint("1;" + BLUE, title)
+            + paint("90", " " + "─" * max(4, width - len(title) - 4)))
 
 
 def _row(label, text, paint):
     return "  " + paint("90", "%-8s" % label) + text
 
 
-def render_power(p, bar_w, paint, width, level=0):
+def render_power(p, bar_w, paint, width, level=0, spacious=False):
     """level 0 = everything, 1 = no blank lines / limits / gpu / extender, 2 = only
-    the numbers that matter (no section titles)."""
+    the numbers that matter (no section titles). `spacious` adds a blank line after
+    each section header when the TUI has height to spare."""
     ra = p["ra"]
     lines = [] if level else ["", _section("Power", width, paint)]
+    if level == 0 and spacious:
+        lines.append("")
     if level == 1:
         lines.append(_section("Power", width, paint))
     if p["bat_w"] and p["bat_status"] == "Discharging":
@@ -743,6 +757,8 @@ def render_power(p, bar_w, paint, width, level=0):
                         if p["bat_status"] == "Charging" and p["bat_w"] else "")
         if level == 0:
             lines += ["", _section("Battery", width, paint)]
+            if spacious:
+                lines.append("")
         elif level == 1:
             lines.append(_section("Battery", width, paint))
         lines.append(_row("charge", "%s %s" % (paint("1", "%d%%" % p["bat_pct"]),
@@ -764,19 +780,26 @@ def render_power(p, bar_w, paint, width, level=0):
 
 
 def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, power, live,
-           manual=None, level=0, max_width=78, show_debug=True):
+           manual=None, level=0, max_width=78, show_debug=True, spacious=False):
     """One frame of `status`, as a list of lines. `max_width` caps the layout (78
     keeps the plain view tidy; the TUI passes its full width); `level` trades detail
     for height: 0 everything, 1 no blank lines/footer/minor rows, 2 the essentials."""
     width = max(40, min(width, max_width)) - 2
-    bar_w = max(8, min(24 if max_width <= 78 else 30, width - 46))
+    if max_width <= 78:
+        bar_w = max(8, min(24, width - 46))
+    else:
+        # wide TUI: the gauge grows with the window; ~20 cells stay for the spark
+        bar_w = max(24, min(60, width - 59))
     mode = current_mode(power).upper()
     src = "AC" if power["ac"] else "BATTERY"
-    pad = max(1, width - len(" omenctl") - len(mode) - len(src) - 3)
-    lines = [paint("1", " omenctl") + " " * pad
-             + paint("1;" + BLUE, mode) + paint("90", " · ") + paint("1", src)]
+    right = (paint("1;" + BLUE, mode) + paint("90", " · ")
+             + paint(GREEN if power["ac"] else YELLOW, "●") + paint("1", " " + src))
+    pad = max(1, width - _vislen(" omenctl") - _vislen(right))
+    lines = [paint("1", " omenctl") + " " * pad + right]
     if level == 0:
         lines += ["", _section("Thermal", width, paint)]
+        if spacious:
+            lines.append("")
     elif level == 1:
         lines.append(_section("Thermal", width, paint))
     for f in fans:
@@ -803,10 +826,16 @@ def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, pow
         extra = 4 if max_width > 78 else 0
         room = max(12, width - (bar_w + 35 + extra))
         spark = _spark(hist[label][-room:], paint) if len(hist[label]) > 2 else ""
-        lines.append("  " + head + fan + "  " + spark)
+        row = "  " + head + fan
+        if spark and max_width > 78:
+            # right-align the history so wide terminals get a clean right edge
+            row += " " * max(2, width - _vislen(row) - _vislen(spark)) + spark
+        else:
+            row += ("  " + spark) if spark else ""
+        lines.append(row)
     if max_width > 78 and level == 0:
         lines.append(paint("90", "  bar = fan duty · spark = temperature history (30–100 °C)"))
-    lines += render_power(power, bar_w, paint, width, level)
+    lines += render_power(power, bar_w, paint, width, level, spacious)
     if level == 0 and show_debug:
         foot = "ec57=%d ec49=%d (+%g)" % (ec57, gpu - gpu_offset, gpu_offset)
         lines += ["", paint("90", "  " + (foot + " · Ctrl-C to quit" if live else foot))]
@@ -852,10 +881,11 @@ class Monitor:
                 "ec57": rig.ec_read(CPU_TEMP)[0],
                 "power": power_state(pm_limit_values(), rig, self.pkg.watts(settle=pkg_settle))}
 
-    def lines(self, d, width, paint, live, level=0, max_width=78, show_debug=True):
+    def lines(self, d, width, paint, live, level=0, max_width=78, show_debug=True,
+              spacious=False):
         return render(FANS, d["cpu"], d["gpu"], d["regs"], d["rpms"], self.hist, width,
                       paint, self.gpu_offset, d["ec57"], d["power"], live, d["manual"],
-                      level, max_width, show_debug)
+                      level, max_width, show_debug, spacious)
 
 
 def state_json(d):
@@ -1037,6 +1067,8 @@ def tui_main(stdscr, args):
     curses.use_default_colors()
     load_theme()
     pairs = init_pairs()
+    accent = int(BLUE.rsplit(";", 1)[1]) if BLUE.startswith("38;5;") else None
+    fill_pair = curses.color_pair(pairs.get(accent, pairs[3]))
     curses.mouseinterval(0)                       # raw press/release, no click synthesis
     wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
     wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
@@ -1096,22 +1128,27 @@ def tui_main(stdscr, args):
         h, w = stdscr.getmaxyx()
         stdscr.erase()
         # fit the view to the window: the most detailed level that leaves room for
-        # the controls (buttons + 2 faders = 4 rows with their spacing, more when tall)
+        # the controls. The compact controls need 5 rows (buttons, 2 faders, message,
+        # hint); they are docked to the bottom, so the slack becomes breathing room.
         for level in (0, 1, 2):
             lines = mon.lines(d, w, paint, False, level, 400, debug)
-            if len(lines) + 8 <= h or level == 2:
+            if len(lines) + 5 <= h or level == 2:
                 break
+        # a tall window gets one blank line after each section header: the data
+        # breathes instead of leaving a hole between the view and the docked controls
+        if level == 0 and h - len(lines) >= 10:
+            lines = mon.lines(d, w, paint, False, 0, 400, debug, spacious=True)
         room = h - len(lines)                         # rows left for the controls
-        if room < 3:                                  # tiny window: trim the view itself
-            lines = lines[:max(0, h - 3)]
+        if room < 5:                                  # tiny window: trim the view itself
+            lines = lines[:max(0, h - 5)]
             room = h - len(lines)
         for y, line in enumerate(lines):
             draw_marked(stdscr, y, 0, line, pairs, w)
         spaced = room >= 8                            # blank rows between the groups
-        by = len(lines) + (1 if spaced else 0)        # buttons row
-        fy = by + (2 if spaced else 1)                # first fader row
-        my = fy + 2 + (1 if spaced else 0)            # message row (when there is room)
-        hy = my + 1                                   # hint row
+        hy = h - 1                                    # hint row
+        my = h - 2                                    # message row
+        fy = h - 5 if spaced else h - 4               # first fader row
+        by = fy - 2 if spaced else fy - 1             # buttons row
         x, buttons = 2, []
         cur = d["power"]["mode"]
         owned = d["regs"][0] != RESET_VALUE
@@ -1144,8 +1181,7 @@ def tui_main(stdscr, args):
             frac = max(0.0, min(1.0, (value - OVERRIDE_MIN) / float(100 - OVERRIDE_MIN)))
             eighths = round(frac * tw * 8)
             full, part = eighths // 8, eighths % 8
-            fill = ((curses.color_pair(pairs[6]) | curses.A_BOLD) if manual_v is not None
-                    else curses.A_DIM) if owned else curses.A_DIM
+            fill = (fill_pair | curses.A_BOLD) if manual_v is not None and owned else curses.A_DIM
             put(y, TX, "█" * full, fill)
             if part and full < tw:
                 put(y, TX + full, " ▏▎▍▌▋▊▉"[part], fill)

@@ -68,7 +68,10 @@ reboots and sleeps):
 
 `sudo omenctl tui` shows the live view with the mode buttons and one fader per
 fan (mouse drag, wheel, or arrow keys). The wide bar is the fan duty and the
-sparkline on the right is the temperature history. A die at or above 85 °C is
+sparkline on the right is the temperature history. The view fills the terminal:
+the gauge grows with the width, the sparkline is right-aligned, and the mode
+buttons and faders are docked at the bottom; a tall window gets a blank line
+after each section header. A die at or above 85 °C is
 marked with `!`. Press `d` for the raw EC debug line, and set `NO_COLOR=1` to
 disable colour (the markers and labels remain). Severity follows the KDE
 Material You scheme (Positive/Neutral/Negative -> green/orange/red); accents

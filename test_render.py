@@ -36,10 +36,10 @@ def plain(line):
     return re.sub(r"\x01[^\x02]*\x02(.*?)\x03", r"\1", line)
 
 
-def render(width, level, max_width, show_debug, no_color):
+def render(width, level, max_width, show_debug, no_color, spacious=False):
     paint = (lambda code, text: text) if no_color else oc._marker_paint
     return oc.render(oc.FANS, 86.0, 77.0, REGS, RPMS, HIST, width, paint, 3.0, 85,
-                     POWER, False, None, level, max_width, show_debug)
+                     POWER, False, None, level, max_width, show_debug, spacious)
 
 
 def theme_test():
@@ -144,9 +144,21 @@ def main():
 
     tui = "\n".join(plain(l) for l in render(120, 0, 400, False, True))
     assert "86°C!" in tui, "hot-die marker missing"
+    assert "● AC" in tui, "power-source dot missing"
     assert "fan " in tui, "fan-duty label missing"
     assert "bar = fan duty" in tui and "temperature history" in tui, "legend missing"
     assert "ec57" not in tui, "debug line should be hidden in the TUI"
+
+    wide = [plain(l) for l in render(120, 0, 400, False, True)]
+    assert len(wide[0]) == len(wide[3]) == len(wide[4]) == 118, \
+        "wide rows should fill the layout width (right-aligned spark)"
+    assert oc._vislen("\x01" + oc.BLUE + "\x02abc\x03") == 3
+    assert oc._vislen("\x1b[1;31mabc\x1b[0m") == 3
+
+    normal = render(120, 0, 400, False, True)
+    airy = render(120, 0, 400, False, True, spacious=True)
+    assert len(airy) == len(normal) + 3, "spacious view adds one blank per section"
+    assert airy[3] == "", "Thermal header should be followed by a blank line"
 
     debug = "\n".join(plain(l) for l in render(120, 0, 400, True, True))
     assert "ec57" in debug, "debug toggle should show the EC line"
@@ -157,7 +169,9 @@ def main():
     assert "ec57" in status, "status keeps the debug line"
 
     print("PASS  %d layout combinations" % checks)
-    print("PASS  hot-die marker, fan label, legend, debug toggle")
+    print("PASS  hot-die marker, power-source dot, fan label, legend, debug toggle")
+    print("PASS  wide rows fill the width (right-aligned spark, accent titles)")
+    print("PASS  spacious vertical rhythm for tall windows")
     theme_test()
     curve_test()
     graph_test()
