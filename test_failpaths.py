@@ -127,11 +127,13 @@ def main():
     ok.append(check("manual CPU 30 % below the curve (16 %): applied, GPU stays on the curve",
                     (CPU, 30) in w and (GPU, 16) in w and (CPU, 16) not in w, str(w)))
     rc, w, r, out = run_manual({"cpu": 20}, lambda n: ("ok", 85, 60), 4)
-    ok.append(check("manual speed is dropped for a fan at >= 80 C (curve takes over, file cleared)",
-                    (CPU, 20) not in w and "dropped" in out and oc.overrides_read() == {}, str(w)))
+    ok.append(check("manual CPU 20 % is kept at 85 C (no auto-drop)",
+                    (CPU, 20) in w and "dropped" not in out
+                    and oc.overrides_read() == {CPU: 20}, str(w)))
     rc, w, r, out = run_manual({"cpu": 20, "gpu": 25}, lambda n: ("ok", 60, 85), 4)
-    ok.append(check("only the hot fan loses its manual speed (GPU dropped, CPU kept)",
-                    (CPU, 20) in w and (GPU, 25) not in w and oc.overrides_read() == {CPU: 20}, str(w)))
+    ok.append(check("manual GPU 25 % is kept at 85 C too",
+                    (CPU, 20) in w and (GPU, 25) in w
+                    and oc.overrides_read() == {CPU: 20, GPU: 25}, str(w)))
     rc, w, r, out = run_manual({"cpu": 12, "gpu": 12}, lambda n: ("ok", 101, 60), 4)
     ok.append(check("critical temperature beats any manual speed: both fans 100 %",
                     (CPU, 100) in w and (GPU, 100) in w and (CPU, 12) not in w))
@@ -141,11 +143,13 @@ def main():
     rc, w, r, out = run_manual({"cpu": 0}, lambda n: ("ok", 60, 60), 4)
     ok.append(check("manual 0 %: a fan can be stopped while cool (60 C)", (CPU, 0) in w, str(w)))
     rc, w, r, out = run_manual({"cpu": 0}, lambda n: ("ok", 66, 60), 4)
-    ok.append(check("a speed below 12 % is dropped from 65 C (not 80 C)",
-                    (CPU, 0) not in w and "dropped" in out and oc.overrides_read() == {}, str(w)))
-    rc, w, r, out = run_manual({"cpu": 12}, lambda n: ("ok", 66, 60), 4)
-    ok.append(check("12 % and above keep the 80 C limit: still manual at 66 C",
-                    "dropped" not in out and oc.overrides_read() == {CPU: 12}, out.strip()[-60:]))
+    ok.append(check("manual 0 % is kept at 66 C (no low-speed limit)",
+                    (CPU, 0) in w and "dropped" not in out
+                    and oc.overrides_read() == {CPU: 0}, str(w)))
+    rc, w, r, out = run_manual({"cpu": 12}, lambda n: ("ok", 90, 60), 4)
+    ok.append(check("12 % is kept at 90 C as well",
+                    "dropped" not in out and oc.overrides_read() == {CPU: 12}
+                    and (CPU, 50) not in w, str(w)))
     oc.overrides_write({"cpu": 50})
     rc, w, r, out = run(lambda n: ("ok", 60, 60), 3)
     ok.append(check("a daemon start clears manual speeds (always begins on the curve)",

@@ -59,12 +59,9 @@ LOCK = "/run/omenctl.lock"      # held by the one running daemon: one writer onl
 CPU_TEMP, GPU_TEMP = 0x57, 0x49
 SET_CPU, SET_GPU = 0x2C, 0x2D          # setpoints; readbacks sit at +2
 RESET_VALUE = 255          # releases the latch back to the EC
-CRITICAL_TEMP = 100.0      # both fans to 100 % at or above this
+CRITICAL_TEMP = 100.0      # both fans to 100 % at or above this (last-resort fail-safe)
 FAN_OVERRIDE = "/run/omenctl/fans"   # manual speeds, "cpu=40" / "gpu=auto" lines
-OVERRIDE_MIN = 0           # % -- a fan may be stopped by hand...
-LOW_SPEED = 12             # ...but below this (the curve's lowest step) it is only
-LOW_SPEED_MAX_TEMP = 65.0  # trusted up to this temperature (C)
-OVERRIDE_MAX_TEMP = 80.0   # any manual speed is dropped for a fan this hot (C)
+OVERRIDE_MIN = 0           # % -- manual speeds span the EC's full 0-100 range
 FAN_KEYS = {"cpu": SET_CPU, "gpu": SET_GPU}
 CURVE_FILE = os.environ.get("OMENCTL_CURVE_FILE", "/etc/omenctl/fans.json")
 
@@ -923,9 +920,9 @@ def daemon_running():
 
 
 def cmd_fan(args):
-    """Manual fan speed. Safety lives in the daemon, not here: a manual speed is
-    dropped for a fan at >= OVERRIDE_MAX_TEMP (LOW_SPEED_MAX_TEMP below LOW_SPEED %),
-    ignored at CRITICAL_TEMP, and forgotten when the daemon restarts or on reboot."""
+    """Manual fan speed. The value is applied as asked at any temperature; only
+    the critical fail-safe (both fans 100 % at CRITICAL_TEMP) overrides it.
+    Manual speeds are forgotten when the daemon restarts or on reboot."""
     manual = overrides_read()
     cur = {k: manual.get(r) for k, r in FAN_KEYS.items()}
     if args.fan is None:
@@ -945,8 +942,7 @@ def cmd_fan(args):
         cur[k] = value
     overrides_write(cur)
     print("%s fan: %s" % (args.fan, "auto (curve)" if value is None else
-          "%d%% manual (dropped at %.0f C)" % (
-              value, OVERRIDE_MAX_TEMP if value >= LOW_SPEED else LOW_SPEED_MAX_TEMP)))
+          "%d%% manual" % value))
     return 0
 
 
@@ -1941,18 +1937,7 @@ def cmd_run(args):
             target = 100 if critical else f["thr"][idx[wr]][2]
             tag = ""
             if wr in manual and not critical:
-                limit = OVERRIDE_MAX_TEMP if manual[wr] >= LOW_SPEED else LOW_SPEED_MAX_TEMP
-                if temp >= limit:                       # too hot to trust a manual speed
-                    left = {k: manual[r] for k, r in FAN_KEYS.items()
-                            if r in manual and r != wr}
-                    try:
-                        overrides_write(left)
-                    except OSError:
-                        pass
-                    print("manual speed dropped for 0x%02X: %.0f C >= %.0f C, back to "
-                          "the curve" % (wr, temp, limit), flush=True)
-                else:
-                    target, tag = manual[wr], " manual"
+                target, tag = manual[wr], " manual"
             target = min(target, f["speed_max"])
             status.append("%s %d%%(%.0fC)%s" % (f["name"].split()[0], target, temp, tag))
             current = regs[wr - SET_CPU]

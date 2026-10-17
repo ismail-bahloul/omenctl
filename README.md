@@ -99,8 +99,8 @@ temperature. A step's effect is visible before saving.
 - `WatchdogSec=10`, pinged every tick;
 - three failed EC reads put both fans at 100 %;
 - five failed EC writes exit, and the unit's stop path resets to `255`;
-- manual speeds are dropped at 80 °C (65 °C below 12 %), and 100 °C forces
-  100 % on both fans;
+- manual speeds are honoured at any temperature; 100 °C forces 100 % on both
+  fans (last-resort fail-safe);
 - `Restart=no`: a failed governor falls back to the EC's curve and stays there.
 
 `omenctl stop` (or `systemctl stop omenctl`) hands the fans back to the EC.
