@@ -68,8 +68,11 @@ reboots and sleeps):
 fan (mouse drag, wheel, or arrow keys). The wide bar is the fan duty and the
 sparkline on the right is the temperature history. A die at or above 85 °C is
 marked with `!`. Press `d` for the raw EC debug line, and set `NO_COLOR=1` to
-disable colour (the markers and labels remain). Keys: `1`-`4` mode, `↑`/`↓`
-fan, `a` auto, `f` start/stop the fan daemon, `q` quit.
+disable colour (the markers and labels remain). The colours follow the active
+KDE Material You scheme (Positive/Neutral/Negative -> green/orange/red,
+Link/DecorationFocus -> accents); `OMENCTL_THEME=/path/file.colors` overrides it
+and `OMENCTL_THEME=none` falls back to the fixed palette. Keys: `1`-`4` mode,
+`↑`/`↓` fan, `a` auto, `f` start/stop the fan daemon, `q` quit.
 
 ## Safety contract
 

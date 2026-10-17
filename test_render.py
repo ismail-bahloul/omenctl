@@ -42,6 +42,36 @@ def render(width, level, max_width, show_debug, no_color):
                      POWER, False, None, level, max_width, show_debug)
 
 
+def theme_test():
+    """The KDE Material You roles map to the expected 256-colour indices."""
+    import tempfile
+    scheme = """[Colors:View]
+ForegroundPositive=#31C193
+ForegroundNeutral=#FF734A
+ForegroundNegative=#FF6A9D
+ForegroundLink=#6F9FE7
+DecorationFocus=#d1bfeb
+"""
+    fd, path = tempfile.mkstemp(suffix=".colors")
+    with os.fdopen(fd, "w") as f:
+        f.write(scheme)
+    old = (oc.GREEN, oc.YELLOW, oc.ORANGE, oc.RED, oc.BLUE, oc.PURPLE)
+    os.environ["OMENCTL_THEME"] = path
+    try:
+        oc.load_theme()
+        assert oc.GREEN == "38;5;72", oc.GREEN
+        assert oc.ORANGE == "38;5;203", oc.ORANGE
+        assert oc.RED == "38;5;205", oc.RED
+        assert oc.BLUE == "38;5;74", oc.BLUE
+        assert oc.PURPLE == "38;5;182", oc.PURPLE
+        assert oc.YELLOW.startswith("38;5;"), oc.YELLOW
+    finally:
+        os.environ.pop("OMENCTL_THEME", None)
+        oc.GREEN, oc.YELLOW, oc.ORANGE, oc.RED, oc.BLUE, oc.PURPLE = old
+        os.unlink(path)
+    print("PASS  Material You semantic roles")
+
+
 def main():
     checks = 0
     for width in (40, 60, 78, 92, 120, 160):
@@ -71,6 +101,7 @@ def main():
 
     print("PASS  %d layout combinations" % checks)
     print("PASS  hot-die marker, fan label, legend, debug toggle")
+    theme_test()
     return 0
 
 

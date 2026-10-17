@@ -270,6 +270,112 @@ GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE = (
     "38;5;114", "38;5;221", "38;5;214", "38;5;203", "38;5;39", "38;5;111")
 
 
+def _hex_256(h):
+    """Nearest xterm-256 index (16-255) for a #rrggbb colour."""
+    h = h.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    steps = (0, 95, 135, 175, 215, 255)
+    best = (10 ** 9, 16)
+    for ri, rv in enumerate(steps):
+        for gi, gv in enumerate(steps):
+            for bi, bv in enumerate(steps):
+                d = (r - rv) ** 2 + (g - gv) ** 2 + (b - bv) ** 2
+                if d < best[0]:
+                    best = (d, 16 + 36 * ri + 6 * gi + bi)
+    gv = max(0, min(23, round(((r + g + b) / 3.0 - 8) / 10.0)))
+    gray = 8 + 10 * gv
+    d = (r - gray) ** 2 + (g - gray) ** 2 + (b - gray) ** 2
+    if d < best[0]:
+        best = (d, 232 + gv)
+    return best[1]
+
+
+def _mix_hex(a, b, t):
+    """Blend two #rrggbb colours, t=0 -> a, t=1 -> b."""
+    a, b = a.lstrip("#"), b.lstrip("#")
+    av = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
+    bv = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(av, bv))
+
+
+def _theme_path():
+    """The KDE colour scheme Material You generated, or None."""
+    env = os.environ.get("OMENCTL_THEME")
+    if env:
+        return None if env.lower() in ("none", "off", "0") else env
+    home = os.path.expanduser("~")
+    user = os.environ.get("SUDO_USER")
+    if user:
+        try:
+            import pwd
+            home = pwd.getpwnam(user).pw_dir
+        except KeyError:
+            pass
+    import configparser
+    name = None
+    try:
+        c = configparser.ConfigParser()
+        c.read(os.path.join(home, ".config", "kdeglobals"))
+        if c.has_section("General") and c.has_option("General", "ColorScheme"):
+            name = c.get("General", "ColorScheme")
+    except (OSError, configparser.Error):
+        pass
+    candidates = []
+    if name:
+        candidates.append(os.path.join(home, ".local", "share", "color-schemes",
+                                       name + ".colors"))
+    candidates.append(os.path.join(home, ".local", "share", "color-schemes",
+                                   "MaterialYouDark.colors"))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_theme():
+    """Use the KDE Material You semantic roles for the TUI colours.
+
+    The Konsole 16-colour scheme is all accent hues (its Color1 is blue, not
+    red), so severity must come from the KDE roles: Positive is the green,
+    Neutral the orange, Negative the red/pink, Link the accent blue and
+    DecorationFocus the purple. Missing roles keep the fixed palette.
+    """
+    global GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE
+    path = _theme_path()
+    if not path:
+        return
+    import configparser
+    c = configparser.ConfigParser()
+    try:
+        c.read(path)
+    except (OSError, configparser.Error):
+        return
+
+    def role(key):
+        for section in ("Colors:View", "Colors:Button", "Colors:Window"):
+            if c.has_section(section) and c.has_option(section, key):
+                return c.get(section, key)
+        return None
+
+    pos = role("ForegroundPositive")
+    neu = role("ForegroundNeutral")
+    neg = role("ForegroundNegative")
+    link = role("ForegroundLink")
+    focus = role("DecorationFocus")
+    if pos:
+        GREEN = "38;5;%d" % _hex_256(pos)
+    if neu:
+        ORANGE = "38;5;%d" % _hex_256(neu)
+    if neg:
+        RED = "38;5;%d" % _hex_256(neg)
+    if link:
+        BLUE = "38;5;%d" % _hex_256(link)
+    if focus:
+        PURPLE = "38;5;%d" % _hex_256(focus)
+    if pos and neu:
+        YELLOW = "38;5;%d" % _hex_256(_mix_hex(pos, neu, 0.5))
+
+
 def _temp_code(t):
     return GREEN if t < 60 else YELLOW if t < 75 else ORANGE if t < 85 else RED
 
@@ -647,6 +753,7 @@ def cmd_status(args):
             if not args.watch:
                 return 0
             time.sleep(1)
+    load_theme()
     tty = sys.stdout.isatty()
     paint = _color(tty and "NO_COLOR" not in os.environ)
     if args.watch and tty:
@@ -729,16 +836,25 @@ def tui_main(stdscr, args):
     curses.set_escdelay(25)          # ms ncurses waits to tell Esc from an escape sequence
     curses.curs_set(0)
     curses.use_default_colors()
+    load_theme()
     pairs = {}
     for n in range(1, 8):
         curses.init_pair(n, n, -1)
         pairs[n] = n
     if curses.COLORS >= 256:
-        # render() uses the 256-colour cube (>= 16) so the terminal theme cannot
-        # remap the semantics; register each code as a curses pair.
-        for i, code in enumerate((39, 111, 114, 221, 214, 203, 208), start=8):
-            curses.init_pair(i, code, -1)
-            pairs[code] = i
+        # render() uses the 256-colour cube (>= 16); register the semantic
+        # roles actually in use (load_theme() may have replaced them).
+        codes = set()
+        for code in (GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE):
+            if code.startswith("38;5;"):
+                try:
+                    codes.add(int(code.rsplit(";", 1)[1]))
+                except ValueError:
+                    pass
+        for i, code in enumerate(sorted(codes), start=8):
+            if code < curses.COLORS:
+                curses.init_pair(i, code, -1)
+                pairs[code] = i
     curses.mouseinterval(0)                       # raw press/release, no click synthesis
     wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
     wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
