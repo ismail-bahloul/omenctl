@@ -1,4 +1,4 @@
-# omenctl, the fan governor unit. Enabled at boot in the same early slot nbfc
+# Omenctl, the fan governor unit. Enabled at boot in the same early slot nbfc
 # used (DefaultDependencies=no, after local-fs, before sysinit/basic).
 #
 #   systemctl start omenctl
@@ -14,7 +14,7 @@
 # ever running as a second writer.
 
 [Unit]
-Description=omenctl (fan governor)
+Description=Omenctl (fan governor)
 Documentation=https://github.com/ismail-bahloul/omenctl
 DefaultDependencies=no
 After=local-fs.target sys-kernel-debug.mount

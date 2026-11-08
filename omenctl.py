@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""omenctl -- fans and power for the HP OMEN 15.
+"""Omenctl -- fans and power for the HP OMEN 15.
 
 Subcommands:
 
@@ -13,7 +13,9 @@ Subcommands:
     reset    alias of stop (`reset --raw`: only write the 255s; the unit's
              stop path and the wrapper use that).
     status   fans + power state: temps, setpoints, profile, limits (-w: live).
+    doctor   read-only self-check: model, EC, SMU, dGPU, WiFi, units, fans.
     profile  apply a CPU/GPU power profile (ac|battery|perf|quiet|eco|auto|guard).
+             The result is read back; a mismatch is retried once and exit 1.
     boost    CPU boost on|off (persistent; off caps at the 3.2 GHz base clock).
 
 (`shadow.py`, next to this file, is the read-only P0 parity check.)
@@ -42,6 +44,7 @@ import argparse
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import signal
@@ -104,6 +107,58 @@ def read_int(path):
             return int(f.read())
     except (OSError, ValueError):
         return None
+
+
+def wifi_iface():
+    """The first wireless netdev (``wlan0`` is not stable across machines)."""
+    for path in sorted(glob.glob("/sys/class/net/*/wireless")):
+        return os.path.basename(os.path.dirname(path))
+    return None
+
+
+def dgpu_pci():
+    """The NVIDIA VGA/3D PCI function, by vendor and class (not by address)."""
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        if (sysfs(dev + "/vendor") == "0x10de"
+                and sysfs(dev + "/class") in ("0x030000", "0x030200")):
+            return os.path.basename(dev)
+    return None
+
+
+def dgpu_driver():
+    """The driver bound to the dGPU (nvidia, vfio-pci, ...), or None."""
+    pci = dgpu_pci()
+    if not pci:
+        return None
+    try:
+        return os.path.basename(os.readlink("/sys/bus/pci/devices/%s/driver" % pci))
+    except OSError:
+        return None
+
+
+def power_supply(kind):
+    """The power_supply device of a given type (Battery, Mains), or None."""
+    for dev in sorted(glob.glob("/sys/class/power_supply/*")):
+        if sysfs(dev + "/type") == kind:
+            return dev
+    return None
+
+
+def wifi_ps_state(iface):
+    """'on' / 'off' as reported by iw, or None if it cannot be read."""
+    if not iface:
+        return None
+    try:
+        out = subprocess.run(["iw", "dev", iface, "get", "power_save"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if "Power save: on" in out:
+        return "on"
+    if "Power save: off" in out:
+        return "off"
+    return None
 
 
 # The fan curves. Each step is (up, down, speed %): move up to this step when
@@ -388,11 +443,12 @@ def cmd_reset(args):
 
 
 SPARK = "▁▂▃▄▅▆▇█"
+PARTIAL = " ▏▎▍▌▋▊▉"             # a cell filled in eighths, from the left
 
 
 def _color(on):
     def paint(code, text):
-        return "\033[%sm%s\033[0m" % (code, text) if on else text
+        return "\033[%sm%s\033[0m" % (_ansi(code), text) if on else text
     return paint
 
 
@@ -401,26 +457,73 @@ def _color(on):
 # die, the TUI legend) carry the same meaning without colour.
 GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE = (
     "38;5;114", "38;5;221", "38;5;214", "38;5;203", "38;5;39", "38;5;111")
+# Text and card edges in the TUI, tinted by the Konsole scheme (None = just dim them).
+MUTED = OUTLINE = None
+# index -> the exact #rrggbb it stands for, for a terminal that can show true colour
+THEME_EXACT = {}
+
+
+def _lab(r, g, b):
+    """sRGB 0-255 -> CIELAB, where a distance is close to a perceived difference."""
+    def linear(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    def f(t):
+        return t ** (1 / 3.0) if t > 0.008856 else 7.787 * t + 16 / 116.0
+    r, g, b = linear(r), linear(g), linear(b)
+    x = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047)
+    y = f(0.2126 * r + 0.7152 * g + 0.0722 * b)
+    z = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
+    return 116 * y - 16, 500 * (x - y), 200 * (y - z)
 
 
 def _hex_256(h):
-    """Nearest xterm-256 index (16-255) for a #rrggbb colour."""
+    """Nearest-looking xterm-256 index (16-255) for a #rrggbb colour: plain RGB distance
+    would trade a saturated accent for a grey-blue that merely has closer channels."""
     h = h.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    want = _lab(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
     steps = (0, 95, 135, 175, 215, 255)
-    best = (10 ** 9, 16)
-    for ri, rv in enumerate(steps):
-        for gi, gv in enumerate(steps):
-            for bi, bv in enumerate(steps):
-                d = (r - rv) ** 2 + (g - gv) ** 2 + (b - bv) ** 2
-                if d < best[0]:
-                    best = (d, 16 + 36 * ri + 6 * gi + bi)
-    gv = max(0, min(23, round(((r + g + b) / 3.0 - 8) / 10.0)))
-    gray = 8 + 10 * gv
-    d = (r - gray) ** 2 + (g - gray) ** 2 + (b - gray) ** 2
-    if d < best[0]:
-        best = (d, 232 + gv)
+    best = (float("inf"), 16)
+    for i in range(16, 256):
+        if i < 232:
+            n = i - 16
+            rgb = steps[n // 36], steps[n // 6 % 6], steps[n % 6]
+        else:
+            rgb = (8 + 10 * (i - 232),) * 3
+        d = sum((p - q) ** 2 for p, q in zip(want, _lab(*rgb)))
+        if d < best[0]:
+            best = (d, i)
     return best[1]
+
+
+def _theme_code(h):
+    """A theme colour as a "38;5;N" code. N is its nearest 256-colour entry, or, when a
+    different theme colour already took that entry, a number from 256 up: the TUI draws
+    both exactly (THEME_EXACT), and _ansi() turns the code back into a real one."""
+    index = _hex_256(h)
+    while THEME_EXACT.get(index, h).lower() != h.lower():
+        index = index + 1 if index >= 256 else 256
+    THEME_EXACT[index] = h
+    return "38;5;%d" % index
+
+
+_INDEX_RE = re.compile(r"38;5;(\d+)")
+
+
+def _code_index(code):
+    """The colour index in a "38;5;N" code (bold may precede), or None."""
+    m = _INDEX_RE.search(code or "")
+    return int(m.group(1)) if m else None
+
+
+def _ansi(code):
+    """`code` as something a terminal understands (see _theme_code); bold may precede."""
+    def real(m):
+        index = int(m.group(1))
+        return "38;5;%d" % (_hex_256(THEME_EXACT[index]) if index in THEME_EXACT and index >= 256
+                            else index)
+    return _INDEX_RE.sub(real, code)
 
 
 def _mix_hex(a, b, t):
@@ -429,6 +532,28 @@ def _mix_hex(a, b, t):
     av = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
     bv = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(av, bv))
+
+
+def _hls(h):
+    import colorsys
+    return colorsys.rgb_to_hls(*[int(h.lstrip("#")[i:i + 2], 16) / 255.0 for i in (0, 2, 4)])
+
+
+def _palette_ramp(colors, steps=4):
+    """`steps` colours picked from the scheme itself, coolest first, hottest last: the
+    palette sorted by how far its hue is from red, near-duplicates dropped. A wallpaper
+    with warm colours gives a real green-to-red ramp; a blue one gives a blue-to-lilac
+    ramp. None if the scheme has too few distinct colours."""
+    def warmth(c):                       # 0 = red-orange, 180 = the coldest hue
+        return abs(((_hls(c)[0] * 360 - 10 + 180) % 360) - 180)
+    ramp = []
+    for c in sorted(set(colors), key=warmth, reverse=True):
+        lab = _lab(*[int(c.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)])
+        if all(sum((x - y) ** 2 for x, y in zip(lab, o[1])) > 9 ** 2 for o in ramp):
+            ramp.append((c, lab))
+    if len(ramp) < steps:
+        return None
+    return [ramp[round(i * (len(ramp) - 1) / float(steps - 1))][0] for i in range(steps)]
 
 
 def _user_home():
@@ -501,18 +626,17 @@ def _konsole_color(path, section):
 
 
 def load_theme():
-    """Material You colours: severity from KDE, accents from Konsole.
+    """Material You colours, from the Konsole scheme: the source Zed, btop, kitty and
+    the prompt all derive from, regenerated on every wallpaper change.
 
-    Zed, btop, kitty and the prompt all derive from the Konsole scheme
-    (MaterialYou.colorscheme) via material_you_lib; fastfetch uses the
-    terminal's ANSI palette, i.e. the same source. That scheme is all accent
-    hues -- its Color1 is blue, there is no red or green -- so it cannot carry
-    temperature severity. The KDE scheme (MaterialYouDark.colors) has the
-    semantic roles: Positive is the green, Neutral the orange, Negative the
-    red/pink. Use those for severity and the Konsole accents for the chrome, so
-    the TUI matches the terminal and stays honest about a hot die.
+    Severity uses nothing else: the scheme's own colours, ordered from its coolest hue
+    to its hottest (_palette_ramp). It is only a green-to-red ramp when the wallpaper
+    has warm colours; on a blue wallpaper it runs blue to lilac, and the `!` on a hot
+    die carries the alarm. Without a Konsole scheme (or with too few colours in it),
+    the semantic roles of the KDE scheme are used (Positive, Neutral, Negative).
     """
-    global GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE
+    global GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE, MUTED, OUTLINE
+    THEME_EXACT.clear()
 
     path = _theme_path()
     if path:
@@ -533,53 +657,73 @@ def load_theme():
             neu = role("ForegroundNeutral")
             neg = role("ForegroundNegative")
             if pos:
-                GREEN = "38;5;%d" % _hex_256(pos)
+                GREEN = _theme_code(pos)
             if neu:
-                ORANGE = "38;5;%d" % _hex_256(neu)
+                ORANGE = _theme_code(neu)
             if neg:
-                RED = "38;5;%d" % _hex_256(neg)
+                RED = _theme_code(neg)
             if pos and neu:
-                YELLOW = "38;5;%d" % _hex_256(_mix_hex(pos, neu, 0.5))
+                YELLOW = _theme_code(_mix_hex(pos, neu, 0.5))
 
     kpath = _konsole_theme_path()
     if kpath:
         accent = _konsole_color(kpath, "Color1") or _konsole_color(kpath, "Color1Intense")
         accent2 = _konsole_color(kpath, "Color3") or _konsole_color(kpath, "Color3Intense")
         if accent:
-            BLUE = "38;5;%d" % _hex_256(accent)
+            BLUE = _theme_code(accent)
+            hues = [_konsole_color(kpath, "Color%d%s" % (i, tone))
+                    for i in range(1, 8) for tone in ("", "Intense")]
+            ramp = _palette_ramp([h for h in hues if h])
+            if ramp:
+                GREEN, YELLOW, ORANGE, RED = [_theme_code(c) for c in ramp]
         if accent2:
-            PURPLE = "38;5;%d" % _hex_256(accent2)
+            PURPLE = _theme_code(accent2)
+        fg, bg = _konsole_color(kpath, "Foreground"), _konsole_color(kpath, "Background")
+        if fg and bg:
+            MUTED = _theme_code(_mix_hex(bg, fg, 0.6))
+            OUTLINE = _theme_code(_mix_hex(bg, fg, 0.3))
 
 
 def _temp_code(t):
     return GREEN if t < 60 else YELLOW if t < 75 else ORANGE if t < 85 else RED
 
 
-def _plain_paint(code, text):
-    """NO_COLOR / --no-color: same text, no ANSI (the TUI still uses attributes)."""
-    return text
-
-
-_MARKER_RE = re.compile(r"\x01[^\x02]*\x02(.*?)\x03")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _vislen(text):
-    """Display width of a painted string: markers and ANSI escapes excluded."""
-    return len(_ANSI_RE.sub("", _MARKER_RE.sub(r"\1", text)))
+    """Display width of a painted string: ANSI escapes excluded."""
+    return len(_ANSI_RE.sub("", text))
 
 
 def _bar(frac, width, code, paint):
     """A gauge `width` cells wide, filled in eighths of a cell."""
     eighths = max(0, min(width * 8, round(frac * width * 8)))
     full, part = eighths // 8, eighths % 8
-    fill = "█" * full + (" ▏▎▍▌▋▊▉"[part] if part else "")
+    fill = "█" * full + (PARTIAL[part] if part else "")
     return paint(code, fill) + paint("90", "░" * (width - len(fill)))
 
 
-def _spark(hist, paint):
-    return "".join(paint(_temp_code(t), SPARK[max(0, min(7, int((t - 30) / 70 * 8)))])
-                   for t in hist)
+def _temp_gauge(temp, peak, width, paint):
+    """Temperature on a 30-100 °C scale, each cell in the colour of the temperature
+    it stands for; a tick marks `peak` while it is above the current reading."""
+    def cells(t):
+        return (max(30, min(100, t)) - 30) / 70.0 * width
+    eighths = round(cells(temp) * 8)
+    full, part = eighths // 8, eighths % 8
+    tick = min(width - 1, int(cells(peak))) if peak > temp else -1
+    out = []
+    for x in range(width):
+        code = _temp_code(30 + 70 * (x + 0.5) / width)
+        if x < full:
+            out.append(paint(code, "█"))
+        elif x == full and part:
+            out.append(paint(code, PARTIAL[part]))
+        elif x == tick:
+            out.append(paint("1;" + _temp_code(peak), "┃"))
+        else:
+            out.append(paint("90", "░"))
+    return "".join(out)
 
 
 def sysfs(path, default=None):
@@ -676,21 +820,22 @@ def battery_extender(rig):
         return None
 
 
-def power_state(ra, rig, pkg_w):
-    """Platform/power facts for `status`, from sysfs and the SMU PM table."""
+def power_state(ra, rig, pkg_w, battery=None):
+    """Platform/power facts for `status`, from sysfs and the SMU PM table. `battery`
+    = (capacity, extender) if the caller already read them from the EC."""
+    cap, extender = battery or (battery_capacity(rig), battery_extender(rig))
     cpu0 = "/sys/devices/system/cpu/cpu0/cpufreq/"
     gov = sysfs(cpu0 + "scaling_governor")
     fmax = read_int(cpu0 + "scaling_max_freq")
-    ac = sysfs("/sys/class/power_supply/ACAD/online") == "1"
-    drv = os.path.basename(os.readlink("/sys/bus/pci/devices/0000:01:00.0/driver")) \
-        if os.path.exists("/sys/bus/pci/devices/0000:01:00.0/driver") else None
+    ac = sysfs((power_supply("Mains") or "/sys/class/power_supply/ACAD") + "/online") == "1"
+    drv = dgpu_driver()
     dpm = None
     for d in os.listdir("/sys/class/drm"):
         p = "/sys/class/drm/%s/device/" % d
         if os.path.exists(p + "pp_dpm_fclk"):
             dpm = sysfs(p + "power_dpm_force_performance_level")
             break
-    bat = "/sys/class/power_supply/BAT0/"
+    bat = (power_supply("Battery") or "/sys/class/power_supply/BAT0") + "/"
     power_now = read_int(bat + "power_now")
     return {"gov": gov, "fmax": fmax, "boost": sysfs(BOOST) == "1", "ac": ac,
             "mode": read_mode(),
@@ -699,8 +844,8 @@ def power_state(ra, rig, pkg_w):
             "bat_status": sysfs(bat + "status"),
             "bat_w": power_now / 1e6 if power_now else None,
             "bat_wh": (read_int(bat + "energy_now") or 0) / 1e6,
-            "bat_cap": battery_capacity(rig),
-            "bat_extender": battery_extender(rig),
+            "bat_cap": cap,
+            "bat_extender": extender,
             "bat_cycles": read_int(bat + "cycle_count"),
             "profile": sysfs("/sys/firmware/acpi/platform_profile")}
 
@@ -714,16 +859,9 @@ def _row(label, text, paint):
     return "  " + paint("90", "%-8s" % label) + text
 
 
-def render_power(p, bar_w, paint, width, level=0, spacious=False):
-    """level 0 = everything, 1 = no blank lines / limits / gpu / extender, 2 = only
-    the numbers that matter (no section titles). `spacious` adds a blank line after
-    each section header when the TUI has height to spare."""
+def render_power(p, bar_w, paint, width):
     ra = p["ra"]
-    lines = [] if level else ["", _section("Power", width, paint)]
-    if level == 0 and spacious:
-        lines.append("")
-    if level == 1:
-        lines.append(_section("Power", width, paint))
+    lines = ["", _section("Power", width, paint)]
     if p["bat_w"] and p["bat_status"] == "Discharging":
         hours = p["bat_wh"] / p["bat_w"]
         # fixed 0-60 W reading scale: the machine has no system power limit
@@ -738,30 +876,23 @@ def render_power(p, bar_w, paint, width, level=0, spacious=False):
             paint("1", "%4.1f" % pkg), paint("90", " / %g W" % lim)), paint))
     ghz = "%.2f GHz" % (p["fmax"] / 1e6) if p["fmax"] else "?"
     boost = paint(GREEN, "boost on") if p["boost"] else paint(YELLOW, "boost off")
-    if level < 2:
-        lines.append(_row("cpu", "%s · max %s · %s" % (p["gov"], ghz, boost), paint))
-    if ra and level == 0:
+    lines.append(_row("cpu", "%s · max %s · %s" % (p["gov"], ghz, boost), paint))
+    if ra:
         lines.append(_row("limits", paint("90", "slow %g W · fast %g W · apu %g W · tctl %g °C" % (
             ra.get("PPT LIMIT SLOW", 0), ra.get("PPT LIMIT FAST", 0),
             ra.get("PPT LIMIT APU", 0), ra.get("THM LIMIT CORE", 0))), paint))
     d = {"nvidia": "nvidia (active)", "vfio-pci": "vfio-pci (off)"}.get(p["dgpu"], p["dgpu"])
-    if level == 0:
-        lines.append(_row("gpu", "dGPU %s · iGPU dpm %s" % (d or "none", p["dpm"] or "?"), paint))
+    lines.append(_row("gpu", "dGPU %s · iGPU dpm %s" % (d or "none", p["dpm"] or "?"), paint))
     if p["bat_pct"] is not None:
         # on AC the sensor reads the power flowing INTO the battery (what btop/KDE
         # show), not what the machine draws -- the adapter reports nothing
         into_battery = (" · %.1f W into the battery" % p["bat_w"]
                         if p["bat_status"] == "Charging" and p["bat_w"] else "")
-        if level == 0:
-            lines += ["", _section("Battery", width, paint)]
-            if spacious:
-                lines.append("")
-        elif level == 1:
-            lines.append(_section("Battery", width, paint))
+        lines += ["", _section("Battery", width, paint)]
         lines.append(_row("charge", "%s %s" % (paint("1", "%d%%" % p["bat_pct"]),
                                                paint("90", p["bat_status"] + into_battery)),
                           paint))
-        if p["bat_cap"] and level < 2:
+        if p["bat_cap"]:
             design, full = p["bat_cap"]
             health = 100.0 * full / design
             code = GREEN if health >= 80 else YELLOW if health >= 60 else RED
@@ -769,7 +900,7 @@ def render_power(p, bar_w, paint, width, level=0, spacious=False):
             lines.append(_row("health", "%s %s" % (
                 paint("1;" + code, "%.0f%%" % health),
                 paint("90", "(%.1f / %.1f Wh%s)" % (full, design, cycles))), paint))
-        if p["bat_extender"] is not None and level == 0:
+        if p["bat_extender"] is not None:
             lines.append(_row("limit", paint(YELLOW, "adaptive extender on (BIOS caps the charge)")
                               if p["bat_extender"] else paint("90", "adaptive extender off"),
                               paint))
@@ -777,33 +908,20 @@ def render_power(p, bar_w, paint, width, level=0, spacious=False):
 
 
 def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, power, live,
-           manual=None, level=0, max_width=78, show_debug=True, spacious=False):
-    """One frame of `status`, as a list of lines. `max_width` caps the layout (78
-    keeps the plain view tidy; the TUI passes its full width); `level` trades detail
-    for height: 0 everything, 1 no blank lines/footer/minor rows, 2 the essentials."""
-    width = max(40, min(width, max_width)) - 2
-    if max_width <= 78:
-        bar_w = max(8, min(24, width - 46))
-    else:
-        # wide TUI: the gauge grows with the window; ~20 cells stay for the spark
-        bar_w = max(24, min(60, width - 59))
+           manual=None):
+    """One frame of `status`, as a list of lines, at most 78 columns wide."""
+    width = max(40, min(width, 78)) - 2
+    bar_w = max(8, min(24, width - 46))
     mode = current_mode(power).upper()
     src = "AC" if power["ac"] else "BATTERY"
     right = (paint("1;" + BLUE, mode) + paint("90", " · ")
              + paint(GREEN if power["ac"] else YELLOW, "●") + paint("1", " " + src))
-    pad = max(1, width - _vislen(" omenctl") - _vislen(right))
-    lines = [paint("1", " omenctl") + " " * pad + right]
-    if level == 0:
-        lines += ["", _section("Thermal", width, paint)]
-        if spacious:
-            lines.append("")
-    elif level == 1:
-        lines.append(_section("Thermal", width, paint))
+    pad = max(1, width - _vislen(" Omenctl") - _vislen(right))
+    lines = [paint("1", " Omenctl") + " " * pad + right, "", _section("Thermal", width, paint)]
     for f in fans:
-        o = f["write_reg"] - SET_CPU
         is_cpu = f["write_reg"] == SET_CPU
         temp = cpu if is_cpu else gpu
-        setp = regs[o]
+        setp = regs[f["write_reg"] - SET_CPU]
         label = "CPU" if is_cpu else "GPU"
         warn = "!" if temp >= 85 else " "
         head = "%s %s  " % (paint("1", label),
@@ -812,30 +930,19 @@ def render(fans, cpu, gpu, regs, rpms, hist, width, paint, gpu_offset, ec57, pow
             fan = paint(ORANGE, "EC auto (not owned by omenctl)")
         else:
             rpm = rpms[0 if is_cpu else 1]
-            fan_prefix = paint("90", "fan ") if max_width > 78 else ""
-            fan = "%s%s %s %s" % (fan_prefix,
-                                  _bar(setp / f["speed_max"], bar_w, BLUE, paint),
-                                  paint("1", "%3d%%" % setp),
-                                  paint("90", "%5s rpm" % (rpm if rpm is not None else "?")))
+            fan = "%s %s %s" % (_bar(setp / f["speed_max"], bar_w, BLUE, paint),
+                                paint("1", "%3d%%" % setp),
+                                paint("90", "%5s rpm" % (rpm if rpm is not None else "?")))
         if manual and f["write_reg"] in manual and setp != RESET_VALUE:
             fan += paint(ORANGE, " manual")
-        # the graph takes whatever width is left after the gauge and the numbers
-        extra = 4 if max_width > 78 else 0
-        room = max(12, width - (bar_w + 35 + extra))
-        spark = _spark(hist[label][-room:], paint) if len(hist[label]) > 2 else ""
-        row = "  " + head + fan
-        if spark and max_width > 78:
-            # right-align the history so wide terminals get a clean right edge
-            row += " " * max(2, width - _vislen(row) - _vislen(spark)) + spark
-        else:
-            row += ("  " + spark) if spark else ""
-        lines.append(row)
-    if max_width > 78 and level == 0:
-        lines.append(paint("90", "  bar = fan duty · spark = temperature history (30–100 °C)"))
-    lines += render_power(power, bar_w, paint, width, level, spacious)
-    if level == 0 and show_debug:
-        foot = "ec57=%d ec49=%d (+%g)" % (ec57, gpu - gpu_offset, gpu_offset)
-        lines += ["", paint("90", "  " + (foot + " · Ctrl-C to quit" if live else foot))]
+        # the temperature gauge takes what is left after the fan gauge and the numbers
+        room = width - (bar_w + 35)
+        peak = max(hist[label][-PEAK_SAMPLES:], default=temp)
+        gauge = _temp_gauge(temp, peak, room, paint) if room >= 8 else ""
+        lines.append("  " + head + fan + (("  " + gauge) if gauge else ""))
+    lines += render_power(power, bar_w, paint, width)
+    foot = "ec57=%d ec49=%d (+%g)" % (ec57, gpu - gpu_offset, gpu_offset)
+    lines += ["", paint("90", "  " + (foot + " · Ctrl-C to quit" if live else foot))]
     return lines
 
 
@@ -857,6 +964,11 @@ def cmd_service(args):
     return rc
 
 
+BATTERY_EVERY = 30.0        # s -- battery capacity and charge cap, read from the EC
+HISTORY_SAMPLES = 1000      # enough for a chart across a very wide window
+PEAK_SAMPLES = 120          # the "recent peak": 2 minutes at one sample a second
+
+
 class Monitor:
     """Everything `status` shows, sampled once per call: the single source for the
     text view, the JSON output and the TUI."""
@@ -866,23 +978,27 @@ class Monitor:
         self.rig = Rig(gpu_offset)
         self.pkg = PkgPower()
         self.hist = {"CPU": [], "GPU": []}
+        self.battery, self.battery_at = None, 0.0
 
     def sample(self, pkg_settle=0.3):
         rig = self.rig
         cpu, gpu, regs = rig.temps()
         for label, t in (("CPU", cpu), ("GPU", gpu)):
-            self.hist[label] = (self.hist[label] + [t])[-120:]
+            self.hist[label] = (self.hist[label] + [t])[-HISTORY_SAMPLES:]
         rpms = [read_int(rig.hp + "/fan%d_input" % i) if rig.hp else None for i in (1, 2)]
+        # 7 of the 13 EC bytes a sample would read, for values that barely ever change
+        if self.battery is None or time.monotonic() - self.battery_at >= BATTERY_EVERY:
+            self.battery = (battery_capacity(rig), battery_extender(rig))
+            self.battery_at = time.monotonic()
         return {"cpu": cpu, "gpu": gpu, "regs": regs, "rpms": rpms,
                 "manual": overrides_read(),
                 "ec57": rig.ec_read(CPU_TEMP)[0],
-                "power": power_state(pm_limit_values(), rig, self.pkg.watts(settle=pkg_settle))}
+                "power": power_state(pm_limit_values(), rig, self.pkg.watts(settle=pkg_settle),
+                                     self.battery)}
 
-    def lines(self, d, width, paint, live, level=0, max_width=78, show_debug=True,
-              spacious=False):
+    def lines(self, d, width, paint, live):
         return render(FANS, d["cpu"], d["gpu"], d["regs"], d["rpms"], self.hist, width,
-                      paint, self.gpu_offset, d["ec57"], d["power"], live, d["manual"],
-                      level, max_width, show_debug, spacious)
+                      paint, self.gpu_offset, d["ec57"], d["power"], live, d["manual"])
 
 
 def state_json(d):
@@ -980,16 +1096,12 @@ def cmd_status(args):
 
 
 # -------------------------------------------------------------------- tui --
-# `omenctl tui`: the status view, live, with the modes as clickable buttons
-# (mouse) or keys 1-4. It reuses render(): the painter below marks the colour
-# codes instead of emitting ANSI, and draw_marked() turns them into curses
-# attributes, so there is one layout for text, watch and TUI.
+# `omenctl tui`: a dashboard of its own (`status` keeps the plain render() layout).
+# Hardware reads and slow actions run on a worker thread, so input never waits on
+# them; the screen is only redrawn when something changed, and gauges ease towards
+# new values at up to 30 frames per second, only for changes large enough to see.
 
-def _marker_paint(code, text):
-    return "\x01%s\x02%s\x03" % (code, text)
-
-
-def _attr_for(code, pairs):
+def _attr_for(code, pairs, color=True):
     """ANSI-ish code ('1;36', '90', '38;5;208') -> curses attribute."""
     import curses
     attr, toks, i = 0, code.split(";"), 0
@@ -1000,36 +1112,45 @@ def _attr_for(code, pairs):
         elif t == "90":
             attr |= curses.A_DIM
         elif t == "38" and i + 2 < len(toks):
-            attr |= curses.color_pair(pairs.get(int(toks[i + 2]), pairs[3]))
+            if color:
+                attr |= curses.color_pair(pairs.get(int(toks[i + 2]), pairs[3]))
             i += 2
-        elif t.isdigit() and 31 <= int(t) <= 37:
+        elif color and t.isdigit() and 31 <= int(t) <= 37:
             attr |= curses.color_pair(pairs[int(t) - 30])
         i += 1
     return attr
 
 
-def draw_marked(win, y, x, text, pairs, maxx):
-    import curses
-    import re
-    attr, pos = 0, 0
-    for m in re.finditer(r"\x01([^\x02]*)\x02(.*?)\x03|([^\x01]+)", text):
-        seg, a = (m.group(2), _attr_for(m.group(1), pairs)) if m.group(2) is not None \
-            else (m.group(3), 0)
-        if x + pos >= maxx:
-            break
-        try:
-            win.addstr(y, x + pos, seg[:maxx - x - pos], a)
-        except curses.error:
-            pass
-        pos += len(seg)
-
-
 TUI_MODES = (("1", "auto"), ("2", "quiet"), ("3", "eco"), ("4", "perf"))
 
 
-FAN_ROWS = (("cpu", "CPU fan", SET_CPU, 0), ("gpu", "GPU fan", SET_GPU, 1))
-SAMPLE_EVERY = 1.0          # s -- hardware is read at this pace; drawing follows events
+FAN_ROWS = (("cpu", "CPU", SET_CPU, 0), ("gpu", "GPU", SET_GPU, 1))
+SAMPLE_EVERY = 1.0          # s -- hardware is read at this pace, off the UI thread
 DRAG_WRITE_EVERY = 0.04     # s -- at most ~25 file writes/s while a fader is dragged
+TUI_FRAME = 0.033           # s -- frame time while a gauge is moving
+TUI_IDLE = 0.25             # s -- how often an idle UI looks for a new sample
+TUI_GLIDE_FROM = 3.0        # °C or % -- smaller changes are drawn at once, not animated
+TOAST_SECS = 5.0            # s -- how long a message stays on the status line
+
+
+def use_direct_color():
+    """Before curses starts: pick the terminal description that gives true colour, so
+    the theme is drawn exactly and not as its nearest 256-colour entries. The semicolon
+    form of konsole-direct is the one every true-colour terminal understands; under sudo
+    COLORTERM is usually gone, but kitty still says who it is."""
+    term = os.environ.get("TERM", "")
+    if term == "xterm-kitty":
+        direct = "kitty-direct"
+    elif (os.environ.get("COLORTERM") in ("truecolor", "24bit")
+          and term.split("-")[0] in ("xterm", "konsole")):
+        direct = "konsole-direct"
+    else:
+        return
+    for base in (os.path.expanduser("~/.terminfo"), "/etc/terminfo", "/usr/share/terminfo",
+                 "/lib/terminfo", "/usr/lib/terminfo"):
+        if os.path.exists(os.path.join(base, direct[0], direct)):
+            os.environ["TERM"] = direct
+            return
 
 
 def init_pairs():
@@ -1040,449 +1161,990 @@ def init_pairs():
         curses.init_pair(n, n, -1)
         pairs[n] = n
     if curses.COLORS >= 256:
-        codes = set()
-        for code in (GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE):
-            if code.startswith("38;5;"):
-                try:
-                    codes.add(int(code.rsplit(";", 1)[1]))
-                except ValueError:
-                    pass
-        for i, code in enumerate(sorted(codes), start=8):
-            if code < curses.COLORS:
-                curses.init_pair(i, code, -1)
+        codes = {_code_index(c) for c in (GREEN, YELLOW, ORANGE, RED, BLUE, PURPLE, MUTED, OUTLINE)}
+        for i, code in enumerate(sorted(c for c in codes if c is not None), start=8):
+            if curses.COLORS > 256 and code in THEME_EXACT:   # true colour: the real value
+                curses.init_pair(i, int(THEME_EXACT[code].lstrip("#"), 16), -1)
                 pairs[code] = i
+            else:                                  # 256 colours: the nearest entry
+                real = _hex_256(THEME_EXACT[code]) if code >= 256 else code
+                if real < curses.COLORS:
+                    curses.init_pair(i, real, -1)
+                    pairs[code] = i
     return pairs
+
+
+class TuiCanvas:
+    """Curses set up for Omenctl, and what the TUI and the curve view draw with."""
+
+    def __init__(self, stdscr):
+        import curses
+        self.win = stdscr
+        curses.set_escdelay(25)      # ms ncurses waits to tell Esc from an escape sequence
+        curses.curs_set(0)
+        curses.use_default_colors()
+        load_theme()
+        self.pairs = init_pairs()
+        self.color = not os.environ.get("NO_COLOR")
+        self.attrs = {}
+        self.width = stdscr.getmaxyx()[1]
+        self.theme_seen = self._theme_stamp()
+        curses.mouseinterval(0)                   # raw press/release, no click synthesis
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+                         | curses.BUTTON1_RELEASED | curses.REPORT_MOUSE_POSITION
+                         | getattr(curses, "BUTTON4_PRESSED", 0)
+                         | getattr(curses, "BUTTON5_PRESSED", 0))
+        # ncurses only turns on mouse mode 1000 (press/release): a terminal then never
+        # reports motion, so a drag would only show up on release. 1002 adds "motion
+        # while a button is held"; the commands turn it off again on the way out.
+        sys.stdout.write("\x1b[?1002h")
+        sys.stdout.flush()
+
+    @staticmethod
+    def _theme_stamp():
+        try:
+            return os.stat(_konsole_theme_path() or "").st_mtime
+        except OSError:
+            return None
+
+    def follow_theme(self):
+        """Take a new wallpaper's colours. Cheap: call it once per sample."""
+        stamp = self._theme_stamp()
+        if stamp != self.theme_seen:
+            self.theme_seen = stamp
+            load_theme()
+            self.pairs = init_pairs()
+            self.attrs.clear()
+
+    def begin(self):
+        """Start a frame. -> (height, width)."""
+        self.win.erase()
+        h, self.width = self.win.getmaxyx()
+        return h, self.width
+
+    def attr(self, code):
+        if code not in self.attrs:
+            themed = self.color and (MUTED if code == "90" else OUTLINE if code == "edge" else None)
+            self.attrs[code] = _attr_for(themed or ("90" if code == "edge" else code),
+                                         self.pairs, self.color)
+        return self.attrs[code]
+
+    def put(self, y, x, text, a=0):       # a too-small terminal must not crash us
+        import curses
+        try:
+            self.win.addnstr(y, x, text, max(0, self.width - x), a)
+        except curses.error:
+            pass
+
+    def segs(self, y, x, segs, room):
+        """Draw [(code, text)], clipped to `room` cells, merging equal neighbours (a
+        gauge is one addstr per colour, not one per cell). -> x after the text."""
+        merged = []
+        for code, text in segs:
+            if merged and merged[-1][0] == code:
+                merged[-1][1] += text
+            else:
+                merged.append([code, text])
+        for code, text in merged:
+            if room <= 0:
+                break
+            text = text[:room]
+            self.put(y, x, text, self.attr(code))
+            x += len(text)
+            room -= len(text)
+        return x
+
+    def runs(self, y, x, row, codes):
+        """Draw a row with one colour code per column, skipping blanks: one addstr per
+        run of a colour."""
+        start = None
+        for c in range(len(row) + 1):
+            inside = c < len(row) and row[c] != " "
+            if start is not None and (not inside or codes[c] != codes[start]):
+                self.put(y, x + start, row[start:c], self.attr(codes[start] or ""))
+                start = None
+            if inside and start is None:
+                start = c
+
+    def card(self, y, x, ch, cw, title, code=None, note=None):
+        edge = self.attr("edge")
+        self.put(y, x, "╭─ ", edge)
+        self.put(y, x + 3, title, self.attr("1;" + (code or BLUE)))
+        tx = x + 3 + len(title)
+        if note:
+            self.put(y, tx, " " + note[0], self.attr(note[1]))
+            tx += len(note[0]) + 1
+        self.put(y, tx, " " + "─" * max(0, x + cw - tx - 2) + "╮", edge)
+        for yy in range(y + 1, y + ch - 1):
+            self.put(yy, x, "│", edge)
+            self.put(yy, x + cw - 1, "│", edge)
+        self.put(y + ch - 1, x, "╰" + "─" * max(0, cw - 2) + "╯", edge)
+
+
+class TuiFeed:
+    """Reads the sensors and runs slow actions on one worker thread, one at a time,
+    so a mode change never overlaps a read and the UI never waits for either."""
+
+    def __init__(self, mon):
+        import queue
+        import threading
+        self.mon = mon
+        self.jobs = queue.Queue()
+        self.empty = queue.Empty
+        self.lock = threading.Lock()
+        self.fresh = None             # (sample, jobs finished before it was read)
+        self.notes = []
+        self.submitted = self.finished = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def submit(self, job):
+        """Queue job() -> message; the returned ticket is passed by take() once a
+        sample read after the job is available."""
+        self.submitted += 1
+        self.jobs.put(job)
+        return self.submitted
+
+    def take(self):
+        """-> (newest unseen sample or None, tickets it covers, messages)."""
+        with self.lock:
+            fresh, self.fresh = self.fresh, None
+            notes, self.notes = self.notes, []
+        sample, done = fresh or (None, 0)
+        return sample, done, notes
+
+    def stop(self, timeout=10.0):
+        """Let a running job finish: a mode change must not die half-applied."""
+        self.jobs.put(None)
+        self.thread.join(timeout)
+
+    def _note(self, text):
+        with self.lock:
+            self.notes.append(text)
+
+    def _run(self):
+        next_read = time.monotonic() + SAMPLE_EVERY
+        while True:
+            try:
+                job = self.jobs.get(timeout=max(0.0, next_read - time.monotonic()))
+            except self.empty:
+                job = False
+            if job is None:
+                return
+            if job:
+                try:
+                    self._note(job())
+                except (Exception, SystemExit) as e:   # keep the UI alive and say so
+                    self._note("failed: %s" % e)
+                self.finished += 1
+            try:
+                sample = self.mon.sample()
+            except Exception as e:                     # keep showing the last values
+                self._note("sensor read failed: %s" % e)
+            else:
+                with self.lock:
+                    self.fresh = (sample, self.finished)
+            next_read = time.monotonic() + SAMPLE_EVERY
+
+
+def _ease(cur, target, dt, tau=0.12, snap=0.1):
+    """One animation step of `cur` towards `target` (exponential, `tau` s)."""
+    cur += (target - cur) * (1.0 - math.exp(-dt / tau))
+    return target if abs(target - cur) < snap else cur
+
+
+def _trend(hist):
+    """'↗' / '↘' / '→' from the last 20 samples, '' with too few of them."""
+    if len(hist) < 6:
+        return ""
+    recent, before = hist[-5:], hist[-20:-5]
+    delta = sum(recent) / len(recent) - sum(before) / len(before)
+    return "↗" if delta >= 1.5 else "↘" if delta <= -1.5 else "→"
+
+
+def _temp_graph(hist, width, height, min_span=20):
+    """A filled history chart, one column per sample, newest at the right. The scale
+    uses round tens of °C and spans `min_span` at least, so it reads like an axis and
+    does not jump with every sample.
+    -> (rows of text, one colour code per column, scale top, scale bottom)."""
+    if width < 1 or height < 1 or not hist:
+        return [], [], 0, 0
+    samples = hist[-width:]
+    lo = int(min(samples) // 10 * 10)
+    hi = int(-(-max(samples) // 10) * 10)
+    hi = max(hi, lo + min_span)                  # headroom above: heat is what matters
+    pad = width - len(samples)
+    rows = [[" "] * width for _ in range(height)]
+    for i, t in enumerate(samples):
+        level = max(1, round((t - lo) / float(hi - lo) * height * 8))  # eighths of a cell
+        for r in range(height):
+            fill = min(8, max(0, level - (height - 1 - r) * 8))
+            if fill:
+                rows[r][pad + i] = SPARK[fill - 1]
+    codes = [None] * pad + [_temp_code(t) for t in samples]
+    return ["".join(r) for r in rows], codes, hi, lo
+
+
+def _tui_power_rows(p):
+    """The Power card, most useful row first: (label, gauge or None, [(code, text)]),
+    where gauge = (animation key, fraction, colour code)."""
+    ra, rows = p["ra"], []
+    pkg, lim = p["pkg_w"], ra.get("STAPM LIMIT")
+    if pkg is not None and lim:
+        rows.append(("cpu pkg", ("pkg", pkg / lim, PURPLE),
+                     [("1", "%4.1f" % pkg), ("90", " / %g W" % lim)]))
+    if p["bat_w"] and p["bat_status"] == "Discharging":
+        hours = p["bat_wh"] / p["bat_w"]
+        # fixed 0-60 W reading scale: the machine has no system power limit
+        rows.append(("system", ("system", p["bat_w"] / 60.0, YELLOW),
+                     [("1", "%4.1f W" % p["bat_w"]),
+                      ("90", "  ~%dh%02d" % (hours, (hours % 1) * 60))]))
+    ghz = "%.2f GHz" % (p["fmax"] / 1e6) if p["fmax"] else "?"
+    rows.append(("cpu", None, [("", "%s · %s · " % (p["gov"], ghz)),
+                               (GREEN, "boost on") if p["boost"] else (YELLOW, "boost off")]))
+    dgpu = {"nvidia": "nvidia (active)", "vfio-pci": "vfio-pci (off)"}.get(p["dgpu"], p["dgpu"])
+    rows.append(("gpu", None, [("", "%s · iGPU %s" % (dgpu or "none", p["dpm"] or "?"))]))
+    return rows
+
+
+def _tui_battery_rows(p):
+    """The Battery card, same shape as _tui_power_rows(); empty without a battery."""
+    pct = p["bat_pct"]
+    if pct is None:
+        return []
+    code = GREEN if pct >= 30 else YELLOW if pct >= 15 else RED
+    # on AC the sensor reads the power flowing INTO the battery (what btop/KDE show),
+    # not what the machine draws -- the adapter reports nothing
+    into = (" · %.1f W in" % p["bat_w"] if p["bat_status"] == "Charging" and p["bat_w"] else "")
+    rows = [("charge", ("battery", pct / 100.0, code),
+             [("1", "%3d%%" % pct), ("90", " %s%s" % (p["bat_status"] or "?", into))])]
+    if p["bat_cap"]:
+        design, full = p["bat_cap"]
+        health = 100.0 * full / design
+        code = GREEN if health >= 80 else YELLOW if health >= 60 else RED
+        cycles = " · %d cycles" % p["bat_cycles"] if p["bat_cycles"] else ""
+        rows.append(("health", None, [("1;" + code, "%.0f%%" % health),
+                                      ("90", " %.1f / %.1f Wh%s" % (full, design, cycles))]))
+    if p["bat_extender"]:
+        rows.append(("limit", None, [(YELLOW, "adaptive extender on")]))
+    return rows
+
+
+def _tui_plan(h, w, power_rows, battery_rows, debug=False):
+    """What fits in an h x w window. The fan faders always stay; then the temperatures,
+    then the Power/Battery rows, and all the height left goes to the charts: side by
+    side on a wide window, stacked on a narrow one that is tall enough."""
+    cols = 2 if w >= 72 else 1
+    left = h - 4 - (1 if debug else 0) - 4        # header+gap, message+hint, Fans card
+    base = 3 if cols == 2 else 4
+    thermal = left >= base
+    if thermal:
+        left -= base
+    want = max(power_rows, battery_rows) if cols == 2 else power_rows + battery_rows
+    panel = max(0, min(want, left - 2))
+    if panel:
+        left -= panel + 2
+    if cols == 2:
+        graph = left if thermal and left >= 2 else 0
+    else:                                         # two cards instead of a shared one: +2
+        graph = (left - 2) // 2 if thermal and left >= 6 else 0
+    return {"cols": cols, "thermal": thermal, "panel": panel, "graph": graph}
 
 
 def tui_main(stdscr, args):
     import contextlib
     import curses
     import io
-    curses.set_escdelay(25)          # ms ncurses waits to tell Esc from an escape sequence
-    curses.curs_set(0)
-    curses.use_default_colors()
-    load_theme()
-    pairs = init_pairs()
-    accent = int(BLUE.rsplit(";", 1)[1]) if BLUE.startswith("38;5;") else None
-    fill_pair = curses.color_pair(pairs.get(accent, pairs[3]))
-    curses.mouseinterval(0)                       # raw press/release, no click synthesis
+    canvas = TuiCanvas(stdscr)
+    put, attr, card, segs_at = canvas.put, canvas.attr, canvas.card, canvas.segs
     wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
     wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
-    curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
-                     | curses.BUTTON1_RELEASED | curses.REPORT_MOUSE_POSITION
-                     | wheel_up | wheel_down)
-    # ncurses only turns on mouse mode 1000 (press/release): a terminal then never
-    # reports motion, so a drag would only show up on release. 1002 adds "motion
-    # while a button is held"; cmd_tui turns it off again on the way out.
-    sys.stdout.write("\x1b[?1002h")
-    sys.stdout.flush()
     # The RAPL power meter averages over 0.3 s on its first call; that is useful
     # for `status` but would leave the TUI blank. Draw something first, then take
     # the first sample without the settle (the next one, one second later, is
     # accurate).
     stdscr.erase()
     try:
-        stdscr.addstr(0, 1, " omenctl", curses.A_BOLD)
+        stdscr.addstr(0, 1, " Omenctl", curses.A_BOLD)
         stdscr.addstr(2, 2, "reading sensors…", curses.A_DIM)
     except curses.error:
         pass
     stdscr.refresh()
     mon = Monitor(args.gpu_offset)
     syslog.openlog("omenctl-profile")
-    paint = _plain_paint if os.environ.get("NO_COLOR") else _marker_paint
-    msg, sel, debug = "", 0, False
-    TX = 24                                       # slider track column
-    drag = None                                   # {"i": fan row, "val": %, "wrote": %, "t": s}
+    d = mon.sample(pkg_settle=0.0)
+    d["manual"] = overrides_read()
+    feed = TuiFeed(mon)
 
-    def put(y, x, text, attr=0):          # a too-small terminal must not crash us
-        try:
-            stdscr.addstr(y, x, text, attr)
-        except curses.error:
-            pass
+    msg, msg_until, sel, debug = "", 0.0, 0, False
+    panels = (None, [], [])      # (sample, Power rows, Battery rows): rebuilt per sample
+    drag = None                  # {"i": fan row, "val": %, "wrote": %, "t": s, "x0", "tw"}
+    buttons = []                 # (y, x0, x1, action) of the frame on screen
+    anim = {}                    # animation key -> value on screen
+    moving = False               # some gauge has not reached its value yet
+    editor = None                # the curve view, while it is open
+    dirty = True
+    last_frame = time.monotonic()
+    frame_dt = 0.0
+    pending_mode, pending_ticket = None, 0
 
-    def store(d, i, value):
+    graphs = {}                  # (position, size) -> (history, its _temp_graph())
+    gliding = set()              # animation keys on their way to a far-away value
+
+    def say(text):
+        nonlocal msg, msg_until
+        msg, msg_until = text, time.monotonic() + TOAST_SECS
+
+    def eased(key, target):
+        """The value to draw this frame for `key`, which is heading to `target`."""
+        nonlocal moving
+        cur = anim.get(key, target)
+        if key not in gliding and abs(target - cur) < TUI_GLIDE_FROM:
+            anim[key] = target                 # sensor noise: not worth 10 frames
+            return target
+        gliding.add(key)
+        value = _ease(cur, target, frame_dt)
+        anim[key] = value
+        if value == target:
+            gliding.discard(key)
+        else:
+            moving = True
+        return value
+
+    def collect():
+        """A paint() for _bar()/_temp_gauge() that records segments, -> (paint, segs)."""
+        segs = []
+
+        def paint(code, text):
+            segs.append((code, text))
+            return text
+        return paint, segs
+
+    def temp_row(y, x, room, name, temp, hist):
+        """'48°C ↗ ███▏░░░░░ max 71°', optionally preceded by the sensor's name."""
+        peak = max(hist[-PEAK_SAMPLES:], default=temp)
+        code = _temp_code(temp)
+        if name:
+            put(y, x, name, attr("1"))
+            x += len(name) + 1
+            room -= len(name) + 1
+        put(y, x, "%3.0f°C" % temp, attr("1;" + code))
+        put(y, x + 5, "!" if temp >= 85 else " ", attr("1;" + code))
+        put(y, x + 6, _trend(hist) or " ", attr("90"))
+        tail = "max %.0f°" % peak
+        width = room - 8 - len(tail) - 1
+        if width >= 4:
+            paint, segs = collect()
+            shown = eased("temp%d,%d" % (y, x), temp)
+            _temp_gauge(shown, shown, width, paint)
+            segs_at(y, x + 8, segs, width)
+            put(y, x + 8 + width + 1, tail, attr("90"))
+
+    def graph(y, x, ch, room, hist):
+        """The history under a temperature: its scale at the right, its time span
+        in the bottom edge of the card."""
+        width = room - 4
+        key = (y, x, ch, room)
+        if graphs.get(key, (None,))[0] is not hist:   # new samples replace the list
+            graphs[key] = (hist, _temp_graph(hist, width, ch))
+        rows, codes, top, bottom = graphs[key][1]
+        for r, row in enumerate(rows):
+            canvas.runs(y + r, x, row, codes)
+        if rows:
+            taken = set()
+            for v in [top, bottom] + list(range(bottom + 10, top, 10)):   # ends first
+                line = round((top - v) / float(top - bottom) * (ch - 1))
+                if not taken & {line - 1, line, line + 1} or v in (top, bottom):
+                    taken.add(line)
+                    put(y + line, x + width + 1, "%d°" % v, attr("90"))
+            span = "%d s" % (min(len(hist), width) * SAMPLE_EVERY)
+            put(y + ch, x + 1, " %s ago " % span, attr("90"))
+            put(y + ch, x + width - 4, " now ", attr("90"))
+
+    def info_card(y, x, ch, cw, title, code, rows):
+        card(y, x, ch, cw, title, code)
+        for r, (label, gauge, segs) in enumerate(rows[:ch - 2]):
+            yy, xx, room = y + 1 + r, x + 2, cw - 4
+            put(yy, xx, "%-8s" % label, attr("90"))
+            xx += 8
+            room -= 8
+            used = sum(len(t) for _c, t in segs)
+            width = room - used - 1
+            if gauge and width >= 6:
+                paint, cells = collect()
+                _bar(eased(gauge[0], max(0.0, min(1.0, gauge[1]))), width, gauge[2], paint)
+                segs_at(yy, xx, cells, width)
+                xx += width + 1
+                room -= width + 1
+            segs_at(yy, xx, segs, room)
+
+    def fans_card(y, width):
+        owned = d["regs"][0] != RESET_VALUE
+        card(y, 0, 4, width, "Fans", None,
+             None if owned else ("· EC auto, not owned by omenctl (f to take over)", ORANGE))
+        for i, (_key, label, reg, ri) in enumerate(FAN_ROWS):
+            yy = y + 1 + i
+            manual_v = d["manual"].get(reg)
+            dragged = drag is not None and drag["i"] == i
+            if dragged:
+                manual_v = drag["val"]
+            # with the daemon stopped the EC decides: no speed of ours is in effect
+            known = owned or dragged
+            value = (OVERRIDE_MIN if not known
+                     else manual_v if manual_v is not None else d["regs"][ri])
+            selected = i == sel
+            put(yy, 2, "▸" if selected else " ", attr("1;" + BLUE))
+            put(yy, 4, label, attr("1") if selected else (0 if owned else attr("90")))
+            if manual_v is None:
+                put(yy, 8, "● auto", attr("" if owned else "90"))
+            else:
+                put(yy, 8, "○ manual", attr(ORANGE if owned else "90"))
+            buttons.append((yy, 8, 16, ("auto_toggle", i)))
+            tx = 18
+            tw = max(10, width - tx - 18)
+            # a dragged knob stays under the mouse; anything else glides to its value
+            shown = value if dragged else eased("fan%d" % i, value)
+            if dragged:
+                anim["fan%d" % i] = value
+            frac = max(0.0, min(1.0, (shown - OVERRIDE_MIN) / float(100 - OVERRIDE_MIN)))
+            knob = round(frac * (tw - 1))
+            live = owned and manual_v is not None
+            fill = attr(("1;" + BLUE) if live else BLUE if owned else "90")
+            put(yy, tx, "━" * knob, fill)
+            put(yy, tx + knob, "●" if live else "○", fill)
+            put(yy, tx + knob + 1, "─" * (tw - knob - 1), attr("90"))
+            buttons.append((yy, tx, tx + tw, ("track", i, tx, tw)))
+            put(yy, tx + tw + 2, "%3d%%" % value if known else "   —",
+                attr("1") if owned else attr("90"))
+            rpm = d["rpms"][ri]
+            if tx + tw + 16 < width:             # a tiny window keeps the percentage
+                put(yy, tx + tw + 7, "%5s rpm" % (rpm if rpm is not None else "?"), attr("90"))
+
+    def header(w):
+        put(0, 1, "Omenctl", attr("1"))
+        owned = d["regs"][0] != RESET_VALUE
+        shown_mode = pending_mode or d["power"]["mode"]
+        x = 10
+        for k, m in TUI_MODES:
+            label = " %s %s " % (k, m)
+            if m == shown_mode:
+                put(0, x, label, attr("1;" + BLUE) | curses.A_REVERSE)
+            else:
+                put(0, x, label, attr("90"))
+            buttons.append((0, x, x + len(label), ("mode", m)))
+            x += len(label) + 1
+        label = " f %s " % ("stop fans" if owned else "start fans")
+        src = "AC" if d["power"]["ac"] else "battery"
+        right = w - 3 - len(src)
+        if x + 2 + len(label) < w:
+            bx = x + 2
+            put(0, bx, label, attr("") if owned else attr(ORANGE) | curses.A_REVERSE)
+            buttons.append((0, bx, bx + len(label), ("fans", owned)))
+            if right > bx + len(label):
+                put(0, right, "●", attr(GREEN if d["power"]["ac"] else YELLOW))
+                put(0, right + 2, src, attr("1"))
+
+    def draw():
+        nonlocal moving, frame_dt, last_frame, panels
+        now = time.monotonic()
+        frame_dt, last_frame = min(0.05, now - last_frame), now
+        moving = False
+        buttons.clear()
+        h, w = canvas.begin()
+        if editor:
+            editor.draw(canvas, h, w, d["cpu"], d["gpu"])
+            if msg and not editor.msg and now < msg_until:   # e.g. a failed sensor read
+                put(h - 2, 2, msg[:max(0, w - 3)], attr("1"))
+            stdscr.refresh()
+            return
+        if panels[0] is not d:                 # the rows only change with a new sample
+            panels = (d, _tui_power_rows(d["power"]), _tui_battery_rows(d["power"]))
+        _d, power_rows, battery_rows = panels
+        plan = _tui_plan(h, w, len(power_rows), len(battery_rows), debug)
+        header(w)
+        y = 2
+        temps = (("CPU", d["cpu"]), ("GPU", d["gpu"]))
+        if plan["thermal"] and (plan["cols"] == 2 or plan["graph"]):
+            ch, left_w = 3 + plan["graph"], w // 2
+            if plan["cols"] == 2:
+                spots = ((y, 0, left_w), (y, left_w, w - left_w))
+                y += ch
+            else:
+                spots = ((y, 0, w), (y + ch, 0, w))
+                y += 2 * ch
+            for (name, temp), (cy, x, cw) in zip(temps, spots):
+                card(cy, x, ch, cw, name, _temp_code(temp))
+                hist = mon.hist[name]
+                # the card's title names the sensor; the key keeps the animation apart
+                temp_row(cy + 1, x + 2, cw - 4, None, temp, hist)
+                if plan["graph"]:
+                    graph(cy + 2, x + 2, plan["graph"], cw - 4, hist)
+        elif plan["thermal"]:
+            card(y, 0, 4, w, "Temperature")
+            for r, (name, temp) in enumerate(temps):
+                temp_row(y + 1 + r, 2, w - 4, name, temp, mon.hist[name])
+            y += 4
+        fans_card(y, w)
+        y += 4
+        if plan["panel"]:
+            ch = plan["panel"] + 2
+            if plan["cols"] == 1 or not battery_rows:
+                rows = power_rows[:1] + battery_rows[:1] + power_rows[1:] + battery_rows[1:]
+                info_card(y, 0, ch, w, "Power", PURPLE, rows)
+            else:
+                left_w = w // 2
+                info_card(y, 0, ch, left_w, "Power", PURPLE, power_rows)
+                info_card(y, left_w, ch, w - left_w, "Battery", GREEN, battery_rows)
+        if debug:
+            ra = d["power"]["ra"]
+            put(h - 3, 2, "ec57=%d ec49=%d (+%g) · slow %g fast %g apu %g W tctl %g °C" % (
+                d["ec57"], d["gpu"] - mon.gpu_offset, mon.gpu_offset, ra.get("PPT LIMIT SLOW", 0),
+                ra.get("PPT LIMIT FAST", 0), ra.get("PPT LIMIT APU", 0),
+                ra.get("THM LIMIT CORE", 0)), attr("90"))
+        if msg and time.monotonic() < msg_until:
+            put(h - 2, 2, msg[:max(0, w - 3)], attr("1"))
+        put(h - 1, 2, "←→ speed · ↑↓ fan · a auto · c curve · q quit", attr("90"))
+        stdscr.refresh()
+
+    def pct(value):
+        return max(OVERRIDE_MIN, min(100, int(value)))
+
+    def speed_now(i):
+        """Fan row i's speed: the manual one if set, else what the EC reports."""
+        manual = d["manual"].get(FAN_ROWS[i][2])
+        return manual if manual is not None else d["regs"][FAN_ROWS[i][3]]
+
+    def store(i, value):
         """Write fan row i's manual speed (None = auto); the daemon applies it."""
         cur = {k: d["manual"].get(r) for k, _l, r, _ri in FAN_ROWS}
-        cur[FAN_ROWS[i][0]] = None if value is None else max(OVERRIDE_MIN, min(100, int(value)))
+        cur[FAN_ROWS[i][0]] = None if value is None else pct(value)
         overrides_write(cur)
+        d["manual"] = overrides_read()
 
-    def set_fan(d, i, value):
+    def set_fan(i, value):
         if d["regs"][0] == RESET_VALUE:
             return "the fan daemon is stopped: press f to start it"
-        store(d, i, value)
-        return "%s: %s" % (FAN_ROWS[i][1], "auto (curve)" if value is None
-                           else "%d%% manual" % max(OVERRIDE_MIN, min(100, int(value))))
+        store(i, value)
+        return "%s fan: %s" % (FAN_ROWS[i][1],
+                               "auto (curve)" if value is None else "%d%% manual" % pct(value))
 
     def pct_at(mx, x0, tw):
-        return max(OVERRIDE_MIN, min(100, round((mx - x0) / float(max(1, tw - 1))
-                                                * (100 - OVERRIDE_MIN)) + OVERRIDE_MIN))
+        return pct(round((mx - x0) / float(max(1, tw - 1)) * (100 - OVERRIDE_MIN)) + OVERRIDE_MIN)
 
-    d = mon.sample(pkg_settle=0.0)
-    next_sample = time.monotonic() + SAMPLE_EVERY
-    while True:
-        d["manual"] = overrides_read()                # cheap, and always current
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-        # fit the view to the window: the most detailed level that leaves room for
-        # the controls. The compact controls need 5 rows (buttons, 2 faders, message,
-        # hint); they are docked to the bottom, so the slack becomes breathing room.
-        for level in (0, 1, 2):
-            lines = mon.lines(d, w, paint, False, level, 400, debug)
-            if len(lines) + 5 <= h or level == 2:
-                break
-        # a tall window gets one blank line after each section header: the data
-        # breathes instead of leaving a hole between the view and the docked controls
-        if level == 0 and h - len(lines) >= 10:
-            lines = mon.lines(d, w, paint, False, 0, 400, debug, spacious=True)
-        room = h - len(lines)                         # rows left for the controls
-        if room < 5:                                  # tiny window: trim the view itself
-            lines = lines[:max(0, h - 5)]
-            room = h - len(lines)
-        for y, line in enumerate(lines):
-            draw_marked(stdscr, y, 0, line, pairs, w)
-        spaced = room >= 8                            # blank rows between the groups
-        hy = h - 1                                    # hint row
-        my = h - 2                                    # message row
-        fy = h - 5 if spaced else h - 4               # first fader row
-        by = fy - 2 if spaced else fy - 1             # buttons row
-        x, buttons = 2, []
-        cur = d["power"]["mode"]
-        owned = d["regs"][0] != RESET_VALUE
-        items = [("%s %s %s " % ("●" if m == cur else " ", k, m), ("mode", m), m == cur)
-                 for k, m in TUI_MODES]
-        items.append((" f %s fans " % ("stop" if owned else "start"), ("fans", owned), False))
-        for label, action, active in items:
-            if by < h and x + len(label) < w:
-                put(by, x, label, curses.A_REVERSE | curses.A_BOLD if active
-                    else curses.A_REVERSE | curses.A_DIM)
-            buttons.append((by, x, x + len(label), action))
-            x += len(label) + 1
-        # manual fan speed: a fader and an "auto" checkbox per fan; the fill moves
-        # in eighths of a cell, so a drag looks smoother than the cell grid
-        tw = max(10, min(100, w - TX - 9))       # <= 100 cells: 1 % per cell or finer
-        for i, (key, label, reg, ri) in enumerate(FAN_ROWS):
-            y = fy + i
-            if y >= h:
-                break
-            manual_v = d["manual"].get(reg)
-            if drag and drag["i"] == i:
-                manual_v = drag["val"]
-            value = d["regs"][ri] if manual_v is None else manual_v
-            value = d["regs"][ri] if value == RESET_VALUE else value
-            dim = 0 if owned else curses.A_DIM
-            put(y, 2, "▸" if i == sel else " ", curses.A_BOLD)
-            put(y, 4, label, (curses.A_BOLD if i == sel else 0) | dim)
-            put(y, 13, "[%s] auto" % ("x" if manual_v is None else " "),
-                (curses.A_BOLD if manual_v is None else 0) | dim)
-            frac = max(0.0, min(1.0, (value - OVERRIDE_MIN) / float(100 - OVERRIDE_MIN)))
-            eighths = round(frac * tw * 8)
-            full, part = eighths // 8, eighths % 8
-            fill = (fill_pair | curses.A_BOLD) if manual_v is not None and owned else curses.A_DIM
-            put(y, TX, "█" * full, fill)
-            if part and full < tw:
-                put(y, TX + full, " ▏▎▍▌▋▊▉"[part], fill)
-            rest = tw - full - (1 if part else 0)
-            put(y, TX + tw - rest, "░" * rest, curses.A_DIM)
-            put(y, TX + tw + 1, "%3d%%" % value, curses.A_BOLD | dim)
-            buttons.append((y, 13, 21, ("auto_toggle", i)))
-            buttons.append((y, TX, TX + tw, ("track", i, TX, tw)))
-        hint = ("drag/←→ 1 % · a auto · ↑/↓ fan · 1-4 mode · c curve · f fans · d debug · q quit"
-                if w >= 90 else
-                "←→ 1 % · a auto · 1-4 mode · c curve · f fans · d debug · q quit")
-        for yy, text, attr in ((my, msg, 0), (hy, hint, curses.A_DIM)):
-            if yy < h and text:
-                put(yy, 2, text[:max(0, w - 3)], attr)
-        stdscr.refresh()
-        # sleep until the next hardware sample, but wake at once on any input
-        stdscr.timeout(max(1, int((next_sample - time.monotonic()) * 1000)))
-        key = stdscr.getch()
-        if time.monotonic() >= next_sample:
-            d = mon.sample()
-            next_sample = time.monotonic() + SAMPLE_EVERY
-        action, mx = None, 0
+    def nudge(i, delta):
+        say(set_fan(i, speed_now(i) + delta))
+
+    def run_action(action):
+        nonlocal sel, pending_mode, pending_ticket
+        if action[0] == "mode":
+            mode = action[1]
+
+            def apply_job():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    set_mode(mode, Ops(False))
+                return "mode: %s" % mode
+            pending_mode, pending_ticket = mode, feed.submit(apply_job)
+            say("mode: %s…" % mode)
+        elif action[0] == "fans":
+            verb = "stop" if action[1] else "start"
+
+            def fans_job():
+                subprocess.run(["systemctl", verb, "omenctl"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return "fans: handed to the EC" if verb == "stop" else "fans: omenctl owns them"
+            feed.submit(fans_job)
+            say("fans: %s…" % ("stopping" if verb == "stop" else "starting"))
+        elif action[0] == "auto_toggle":
+            sel = action[1]
+            auto = d["manual"].get(FAN_ROWS[sel][2]) is None   # auto -> manual at today's speed
+            say(set_fan(sel, speed_now(sel) if auto else None))
+
+    def mouse():
+        nonlocal sel, drag
+        try:
+            _id, mx, my, _z, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if wheel_up and bstate & (wheel_up | wheel_down):    # wheel over a fader: +-1 %
+            for (yy, _x0, _x1, act) in buttons:
+                if act[0] == "track" and my == yy:
+                    sel = act[1]
+                    nudge(sel, 1 if bstate & wheel_up else -1)
+        elif bstate & curses.REPORT_MOUSE_POSITION:          # motion
+            if drag:
+                drag["val"] = pct_at(mx, drag["x0"], drag["tw"])
+                if (drag["val"] != drag["wrote"]
+                        and time.monotonic() - drag["t"] >= DRAG_WRITE_EVERY):
+                    store(drag["i"], drag["val"])
+                    drag["wrote"], drag["t"] = drag["val"], time.monotonic()
+        elif bstate & curses.BUTTON1_RELEASED:
+            if drag:                       # the value under the release always lands
+                drag["val"] = pct_at(mx, drag["x0"], drag["tw"])
+                if drag["val"] != drag["wrote"]:
+                    store(drag["i"], drag["val"])
+                say("%s fan: %d%% manual" % (FAN_ROWS[drag["i"]][1], drag["val"]))
+                drag = None
+        elif drag:
+            pass                                              # a stray press mid-drag
+        elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            for (yy, x0, x1, act) in list(buttons):
+                if my == yy and x0 <= mx < x1:
+                    if act[0] == "track" and d["regs"][0] != RESET_VALUE:
+                        sel = act[1]
+                        val = pct_at(mx, act[2], act[3])
+                        store(act[1], val)
+                        drag = {"i": act[1], "val": val, "wrote": val,
+                                "t": time.monotonic(), "x0": act[2], "tw": act[3]}
+                        if bstate & curses.BUTTON1_CLICKED:   # no separate release
+                            say("%s fan: %d%% manual" % (FAN_ROWS[act[1]][1], val))
+                            drag = None
+                    elif act[0] == "track":
+                        say("the fan daemon is stopped: press f to start it")
+                    else:
+                        run_action(act)
+
+    def handle(key):
+        """One input event. -> True to quit."""
+        nonlocal sel, debug, editor
+        if editor:                          # the curve view has the keyboard while open
+            if editor.handle(key):
+                editor = None
+            return False
         if key in (ord("q"), 27):
-            return 0
-        if key in (ord("1"), ord("2"), ord("3"), ord("4")):
-            action = ("mode", TUI_MODES[key - ord("1")][1])
+            return True
+        if key == curses.KEY_RESIZE:
+            graphs.clear()
+        elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+            run_action(("mode", TUI_MODES[key - ord("1")][1]))
         elif key == ord("f"):
-            action = ("fans", owned)
+            run_action(("fans", d["regs"][0] != RESET_VALUE))
         elif key in (curses.KEY_UP, curses.KEY_DOWN, 9):
             sel = 1 - sel
         elif key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_PPAGE, curses.KEY_NPAGE):
-            delta = {curses.KEY_LEFT: -1, curses.KEY_RIGHT: 1,
-                     curses.KEY_PPAGE: 10, curses.KEY_NPAGE: -10}[key]
-            now = d["manual"].get(FAN_ROWS[sel][2])
-            base = now if now is not None else d["regs"][FAN_ROWS[sel][3]]
-            msg = set_fan(d, sel, base + delta)
+            nudge(sel, {curses.KEY_LEFT: -1, curses.KEY_RIGHT: 1,
+                        curses.KEY_PPAGE: 10, curses.KEY_NPAGE: -10}[key])
         elif key in (ord("a"), ord(" ")):
-            action = ("auto_toggle", sel)
+            run_action(("auto_toggle", sel))
         elif key == ord("c"):
-            curses.def_prog_mode()
-            curses.endwin()
-            try:
-                subprocess.run([sys.executable, os.path.abspath(__file__), "curve",
-                                "cpu" if sel == 0 else "gpu"], check=False)
-            finally:
-                curses.reset_prog_mode()
-                stdscr.clear()
-                stdscr.refresh()
-            d = mon.sample()
-            next_sample = time.monotonic() + SAMPLE_EVERY
-            msg = "curve editor closed"
+            editor = CurveEditor(sel)
         elif key == ord("d"):
             debug = not debug
-            msg = "debug: %s" % ("on" if debug else "off")
+            say("debug: %s" % ("on" if debug else "off"))
+        elif key == curses.KEY_MOUSE:
+            mouse()
+        return False
+
+    feed.start()
+    try:
+        toast_up = False
+        while True:
+            sample, done, notes = feed.take()
+            if sample is not None:
+                canvas.follow_theme()
+                sample["manual"] = overrides_read()    # newer than the sample's own copy
+                d = sample
+                dirty = True
+                if pending_mode and done >= pending_ticket:
+                    pending_mode = None
+            for note in notes:
+                say(note)
+                dirty = True
+            shown = bool(msg) and time.monotonic() < msg_until
+            if shown != toast_up:                      # a message just appeared or expired
+                toast_up = shown
+                dirty = True
+            if dirty or moving:
+                draw()
+                dirty = False
+            stdscr.timeout(int((TUI_FRAME if moving else TUI_IDLE) * 1000))
+            key = stdscr.getch()
+            while key != -1:                 # a burst of mouse motion costs a single frame
+                if handle(key):
+                    return 0
+                dirty = True
+                stdscr.timeout(0)
+                key = stdscr.getch()
+    finally:
+        feed.stop()
+
+
+def _curve_layout(h, w, steps):
+    """Where the curve editor's cards go in an h x w window: the table always, the chart
+    if it fits. Rows that do not fit scroll; the two status lines go first."""
+    avail = max(3, h - 4)                    # header + gap above, message + hint below
+    side = w >= 72
+    wanted = steps + 5                       # borders, column heading, two status lines
+    table_h = avail if side else min(avail, wanted)
+    inner = table_h - 2 - 1                  # minus the borders and the heading
+    status = max(0, min(2, inner - min(steps, max(1, inner - 2))))
+    table_w = 38 if side else w
+    if side:
+        chart = (2, table_w, avail, w - table_w) if w - table_w >= 20 and avail >= 6 else None
+    else:
+        chart = (2 + table_h, 0, avail - table_h, w) if avail - table_h >= 6 else None
+    return {"table_h": table_h, "table_w": table_w, "visible": max(1, inner - status),
+            "status": status, "chart": chart}
+
+
+def _scroll_first(row, count, visible):
+    """The first step to show so that step `row` stays in a list of `visible` rows, kept
+    around the middle of it when the list scrolls."""
+    if count <= visible:
+        return 0
+    return max(0, min(count - visible, row - visible // 2))
+
+
+class CurveEditor:
+    """Edit the fan curves in FANS; the daemon reloads /etc/omenctl/fans.json on mtime.
+    Used by the TUI's `c` view and by `omenctl curve`. Everything on this thread."""
+
+    COLUMNS = ((9, 5), (16, 7), (26, 6))     # x in the card, width: up, down, duty
+
+    def __init__(self, fan=0):
+        for i, f in enumerate(FANS):         # what the file says, not a discarded edit
+            f["thr"] = [tuple(x) for x in DEFAULT_THR[i]]
+        load_curve_file()
+        self.fan, self.row, self.col = fan, 0, 0
+        self.dirty = self.confirm_quit = False
+        self.msg = ""
+        self.buttons = []                    # (y, x0, x1, action) of the frame on screen
+        self.chart_cache = (None, None)
+
+    def bump(self, delta):
+        thr = FANS[self.fan]["thr"]
+        if not thr:
+            return
+        value = list(thr[self.row])
+        if self.col == 0:                    # up
+            value[0] = max(value[1] + 1, min(120, value[0] + delta))
+        elif self.col == 1:                  # down
+            value[1] = max(0, min(value[0] - 1, value[1] + delta))
+        else:                                # duty
+            value[2] = max(0, min(100, value[2] + delta))
+        thr[self.row] = tuple(value)
+        self.dirty = True
+
+    def select_fan(self, fan):
+        self.fan, self.row, self.col = fan, 0, 0
+
+    def click(self, mx, my, bstate):
+        """A mouse event: wheel over a cell is +-1, a click selects a cell or a fan."""
+        import curses
+        up = getattr(curses, "BUTTON4_PRESSED", 0)
+        down = getattr(curses, "BUTTON5_PRESSED", 0)
+        for yy, x0, x1, action in self.buttons:
+            if my != yy or not x0 <= mx < x1:
+                continue
+            if action[0] == "fan" and bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                self.select_fan(action[1])
+            elif action[0] == "cell":
+                if bstate & (up | down):
+                    self.row, self.col = action[1], action[2]
+                    self.bump(1 if bstate & up else -1)
+                elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                    self.row, self.col = action[1], action[2]
+            return
+
+    def handle(self, key):
+        """One input event. -> True to leave the editor."""
+        import curses
+        if key == curses.KEY_RESIZE:
+            return False
+        confirming, self.confirm_quit = self.confirm_quit, False
+        self.msg = ""
+        thr = FANS[self.fan]["thr"]
+        if key in (ord("q"), 27):
+            if self.dirty and not confirming:
+                self.msg = "unsaved curve: s save · q again to discard"
+                self.confirm_quit = True
+                return False
+            return True
+        if key == ord("Q"):
+            return True
+        if key == ord("s"):
+            err = save_curve_file()
+            if err:
+                self.msg = err
+            else:
+                self.dirty = False
+                self.msg = "saved; the daemon reloads within 1 s"
+        elif key == ord("r"):
+            FANS[self.fan]["thr"] = [tuple(x) for x in DEFAULT_THR[self.fan]]
+            self.row = self.col = 0
+            self.dirty = True
+            self.msg = "reset to the embedded defaults (s to save)"
+        elif key in (ord("1"), ord("2")):
+            self.select_fan(key - ord("1"))
+        elif key == curses.KEY_UP:
+            self.row = max(0, self.row - 1)
+        elif key == curses.KEY_DOWN:
+            self.row = min(len(thr) - 1, self.row + 1)
+        elif key == 9:                       # Tab
+            self.col = (self.col + 1) % 3
+        elif key == curses.KEY_BTAB:
+            self.col = (self.col - 1) % 3
+        elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            self.bump(-1 if key == curses.KEY_LEFT else 1)
+        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.bump(-5 if key == curses.KEY_PPAGE else 5)
         elif key == curses.KEY_MOUSE:
             try:
                 _id, mx, my, _z, bstate = curses.getmouse()
             except curses.error:
-                continue
-            if wheel_up and bstate & (wheel_up | wheel_down):    # wheel over a fader: +-1 %
-                for (yy, _x0, _x1, act) in buttons:
-                    if act[0] == "track" and my == yy:
-                        sel = act[1]
-                        now = d["manual"].get(FAN_ROWS[sel][2])
-                        base = now if now is not None else d["regs"][FAN_ROWS[sel][3]]
-                        msg = set_fan(d, sel, base + (1 if bstate & wheel_up else -1))
-            elif bstate & curses.REPORT_MOUSE_POSITION:          # motion
-                if drag:
-                    drag["val"] = pct_at(mx, TX, tw)
-                    if (drag["val"] != drag["wrote"]
-                            and time.monotonic() - drag["t"] >= DRAG_WRITE_EVERY):
-                        store(d, drag["i"], drag["val"])
-                        drag["wrote"], drag["t"] = drag["val"], time.monotonic()
-            elif bstate & curses.BUTTON1_RELEASED:
-                if drag:                       # the value under the release always lands
-                    drag["val"] = pct_at(mx, TX, tw)
-                    if drag["val"] != drag["wrote"]:
-                        store(d, drag["i"], drag["val"])
-                    msg = "%s: %d%% manual" % (FAN_ROWS[drag["i"]][1], drag["val"])
-                    drag = None
-            elif drag:
-                pass                                              # a stray press mid-drag
-            elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
-                for (yy, x0, x1, act) in buttons:
-                    if my == yy and x0 <= mx < x1:
-                        if act[0] == "track" and owned:
-                            sel = act[1]
-                            val = pct_at(mx, act[2], act[3])
-                            store(d, act[1], val)
-                            drag = {"i": act[1], "val": val, "wrote": val,
-                                    "t": time.monotonic()}
-                            if bstate & curses.BUTTON1_CLICKED:   # no separate release
-                                msg, drag = "%s: %d%% manual" % (FAN_ROWS[act[1]][1], val), None
-                        elif act[0] == "track":
-                            msg = "the fan daemon is stopped: press f to start it"
-                        else:
-                            action = act
-        if action and action[0] == "mode":
-            with contextlib.redirect_stdout(io.StringIO()):
-                set_mode(action[1], Ops(False))
-            msg = "mode: %s" % action[1]
-        elif action and action[0] == "fans":
-            verb = "stop" if action[1] else "start"
-            subprocess.run(["systemctl", verb, "omenctl"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-            msg = "fans: handed to the EC" if verb == "stop" else "fans: omenctl owns them"
-        elif action and action[0] == "auto_toggle":
-            sel = action[1]
-            if d["manual"].get(FAN_ROWS[sel][2]) is None:    # auto -> manual at today's speed
-                msg = set_fan(d, sel, d["regs"][FAN_ROWS[sel][3]])
-            else:
-                msg = set_fan(d, sel, None)
+                return False
+            self.click(mx, my, bstate)
+        return False
 
+    def _chart(self, thr, width, height):
+        key = (tuple(thr), width, height, GREEN, YELLOW, ORANGE, RED)   # a new theme recolours
+        if self.chart_cache[0] != key:
+            self.chart_cache = (key, curve_graph(thr, width, height))
+        return self.chart_cache[1]
 
-CURVE_COLS = ("up", "down", "duty")
+    def draw(self, c, h, w, cpu, gpu):
+        import curses
+        self.buttons.clear()
+        thr = FANS[self.fan]["thr"]
+        temp = cpu if self.fan == 0 else gpu
+        layout = _curve_layout(h, w, len(thr))
+        c.put(0, 1, "Omenctl", c.attr("1"))
+        c.put(0, 9, "› curve", c.attr("90"))
+        x = 18
+        for i, row in enumerate(FAN_ROWS):
+            label = " %d %s " % (i + 1, row[1])
+            on = i == self.fan
+            c.put(0, x, label, c.attr("1;" + BLUE) | curses.A_REVERSE if on else c.attr("90"))
+            self.buttons.append((0, x, x + len(label), ("fan", i)))
+            x += len(label) + 1
+        if self.dirty:
+            c.put(0, w - 10, "● unsaved", c.attr(ORANGE))
+        self._table(c, thr, temp, layout)
+        if layout["chart"]:
+            self._graph(c, thr, temp, layout["chart"])
+        err = curve_error(thr)
+        if self.msg:
+            c.put(h - 2, 2, self.msg[:max(0, w - 3)], c.attr("1"))
+        elif err:
+            c.put(h - 2, 2, ("invalid: " + err)[:max(0, w - 3)], c.attr("1;" + RED))
+        hint = ("↑↓ step · Tab column · ←→ ±1 · PgUp/PgDn ±5 · 1/2 fan · s save · r reset · q back"
+                if w >= 85 else "↑↓ step · Tab column · ←→ ±1 · s save · q back")
+        c.put(h - 1, 2, hint[:max(0, w - 3)], c.attr("90"))
+
+    def _table(self, c, thr, temp, layout):
+        import curses
+        ch, cw = layout["table_h"], layout["table_w"]
+        c.card(2, 0, ch, cw, "Steps")
+        heading = c.attr("90")
+        c.put(3, 5, "#", heading)
+        c.put(3, 9, "up °C", heading)
+        c.put(3, 16, "down °C", heading)
+        c.put(3, 28, "duty", heading)
+        current = curve_current_index(thr, temp)
+        first = _scroll_first(self.row, len(thr), layout["visible"])
+        for i in range(first, min(len(thr), first + layout["visible"])):
+            y = 4 + i - first
+            selected = i == self.row
+            c.put(y, 2, "▸" if selected else " ", c.attr("1;" + BLUE))
+            if i == current:
+                c.put(y, 3, "●", c.attr(_temp_code(temp)))
+            c.put(y, 4, "%2d" % (i + 1), c.attr("1") if selected else c.attr("90"))
+            texts = ("%5d" % thr[i][0], "%7d" % thr[i][1], "%4d %%" % thr[i][2])
+            for col, ((x, width), text) in enumerate(zip(self.COLUMNS, texts)):
+                a = c.attr("1") if selected else 0
+                if selected and col == self.col:
+                    a = c.attr("1;" + BLUE) | curses.A_REVERSE
+                c.put(y, x, text, a)
+                self.buttons.append((y, x, x + width, ("cell", i, col)))
+        if layout["status"] and temp is not None and current is not None:
+            y = 2 + ch - 1 - layout["status"]
+            c.put(y, 2, "now  %3.0f°C → %d %%" % (temp, thr[current][2])
+                  + (" !" if temp >= 85 else ""), c.attr("1;" + _temp_code(temp)))
+            if layout["status"] > 1 and current + 1 < len(thr):
+                nxt = thr[current + 1]
+                c.put(y + 1, 2, "next %3d°C → %d %%" % (nxt[0], nxt[2]), c.attr("90"))
+        elif layout["status"] and temp is None:
+            c.put(2 + ch - 1 - layout["status"], 2, "temperature unavailable", c.attr(ORANGE))
+
+    def _graph(self, c, thr, temp, spot):
+        y, x, ch, cw = spot
+        c.card(y, x, ch, cw, "Duty by temperature")
+        width, height = cw - 9, ch - 3       # room for the labels and the marker row
+        rows, codes = self._chart(thr, width, height)
+        for r, (row, code) in enumerate(zip(rows, codes)):
+            c.runs(y + 2 + r, x + 2, "".join(row).replace("·", " "), code)
+        for pct, line in ((100, 0), (50, (height - 1) // 2), (0, height - 1)):
+            c.put(y + 2 + line, x + 2 + width + 1, "%3d%%" % pct, c.attr("90"))
+        bottom = y + ch - 1
+        c.put(bottom, x + 2, " 30° ", c.attr("90"))
+        c.put(bottom, x + 2 + width - 6, " 100° ", c.attr("90"))
+
+        def column(t):
+            return int(round((t - 30) / 70.0 * (width - 1)))
+        up = thr[self.row][0] if thr else None
+        if up is not None and 30 <= up <= 100:          # ties the table to the chart
+            c.put(bottom, x + 2 + column(up), "┴", c.attr("1;" + BLUE))
+        if temp is not None and 30 <= temp <= 100:      # where the temperature is now
+            mx = column(temp)
+            c.put(y + 1, x + 2 + mx, "▼", c.attr("1;" + _temp_code(temp)))
+            for r, row in enumerate(rows):
+                if row[mx] == "·":
+                    c.put(y + 2 + r, x + 2 + mx, "│", c.attr("edge"))
 
 
 def curve_main(stdscr, fan_key):
-    """Edit one fan curve; the daemon reloads /etc/omenctl/fans.json on mtime."""
-    import curses
-    curses.set_escdelay(25)
-    curses.curs_set(0)
-    curses.use_default_colors()
-    load_theme()
-    pairs = init_pairs()
-    load_curve_file()
-
-    fan = 0 if fan_key == "cpu" else 1
-    row = col = 0
-    dirty = confirm_quit = False
-    msg = ""
+    """`omenctl curve`: the TUI's curve view on its own."""
+    canvas = TuiCanvas(stdscr)
+    editor = CurveEditor(0 if fan_key == "cpu" else 1)
     rig = None
     try:
         rig = Rig(3.0)
     except OSError:
         pass
     cpu = gpu = None
-
-    def put(y, x, text, attr=0):
-        try:
-            stdscr.addstr(y, x, text, attr)
-        except curses.error:
-            pass
-
-    def code_attr(code):
-        if isinstance(code, str) and code.startswith("38;5;"):
-            try:
-                return curses.color_pair(pairs.get(int(code.rsplit(";", 1)[1]), pairs[3]))
-            except ValueError:
-                pass
-        return 0
-
-    def sample():
-        nonlocal cpu, gpu
-        if rig is None:
-            return
-        try:
-            cpu, gpu, _ = rig.temps()
-        except OSError:
-            cpu = gpu = None
-
-    def bump(delta):
-        nonlocal dirty, confirm_quit
-        thr = FANS[fan]["thr"]
-        if not thr:
-            return
-        value = list(thr[row])
-        if col == 0:                       # up
-            value[0] = max(value[1] + 1, min(120, value[0] + delta))
-        elif col == 1:                     # down
-            value[1] = max(0, min(value[0] - 1, value[1] + delta))
-        else:                              # duty
-            value[2] = max(0, min(100, value[2] + delta))
-        thr[row] = tuple(value)
-        dirty = True
-        confirm_quit = False
-
-    sample()
-    while True:
-        thr = FANS[fan]["thr"]
-        err = curve_error(thr)
-        temp = cpu if fan == 0 else gpu
-        cur = curve_current_index(thr, temp)
-
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-        put(0, 1, " omenctl curve", curses.A_BOLD)
-        title = FANS[fan]["name"]
-        put(0, max(0, w - len(title) - 2), title + " ", curses.A_BOLD)
-        put(2, 2, "──── curve ────", curses.A_DIM)
-        put(3, 4, "#", curses.A_DIM)
-        put(3, 10, "up °C", curses.A_DIM)
-        put(3, 19, "down °C", curses.A_DIM)
-        put(3, 28, "duty", curses.A_DIM)
-        for i, (up, down, duty) in enumerate(thr):
-            y = 4 + i
-            if y >= h - 3:
-                break
-            selected = i == row
-            attr = curses.A_BOLD if selected else 0
-            put(y, 2, "▸" if selected else " ", code_attr(GREEN if i == cur else 0) | attr)
-            put(y, 4, "%3d" % (i + 1), attr)
-            for c, value in enumerate((up, down, duty)):
-                x = 10 + c * 9
-                text = "%4d %%" % value if c == 2 else "%4d" % value
-                put(y, x, text, attr | (curses.A_REVERSE if selected and c == col else 0))
-        gx, gw = 40, w - 42
-        gh = min(len(thr), h - 12)
-        if gw >= 24 and gh >= 4:
-            rows, codes = curve_graph(thr, gw, gh)
-            put(2, gx, "duty % by °C", curses.A_DIM)
-            for gy, (grow, gcode) in enumerate(zip(rows, codes)):
-                for gxx, (ch, code) in enumerate(zip(grow, gcode)):
-                    put(4 + gy, gx + gxx, ch, code_attr(code) if code else curses.A_DIM)
-            put(4 + gh, gx, "30°C", curses.A_DIM)
-            put(4 + gh, gx + gw - 4, "100°C", curses.A_DIM)
-            if temp is not None and 30 <= temp <= 100:
-                mx = int(round((temp - 30) / 70.0 * (gw - 1)))
-                put(3, gx + mx, "▼", curses.A_BOLD | code_attr(_temp_code(temp)))
-                for gy in range(gh):
-                    if rows[gy][mx] in ("·", " "):
-                        put(4 + gy, gx + mx, "│", curses.A_DIM)
-        y = 4 + len(thr) + 1
-        if temp is None:
-            put(y, 2, "temperature unavailable", code_attr(ORANGE))
-        else:
-            put(y, 2, "temp %3.0f °C → step %d (%d %%)"
-                % (temp, (cur or 0) + 1, thr[cur][2] if cur is not None else 0),
-                code_attr(_temp_code(temp)))
-            if cur is not None and cur + 1 < len(thr):
-                nxt = thr[cur + 1]
-                put(y + 1, 2, "next %3d °C → %d %%" % (nxt[0], nxt[2]), curses.A_DIM)
-        if err:
-            put(y + 2, 2, "invalid: " + err, code_attr(RED))
-        if msg:
-            put(y + 3, 2, msg[:max(0, w - 3)])
-        hint = ("↑/↓ step · Tab column · ←/→ 1 · PgUp/PgDn 5 · 1/2 fan · "
-                "s save · r reset · q quit")
-        put(h - 1, 2, hint[:max(0, w - 3)], curses.A_DIM)
-        stdscr.refresh()
-
-        stdscr.timeout(1000)
-        key = stdscr.getch()
-        if key == -1:
-            sample()
-            continue
-        if key in (ord("q"), 27):
-            if dirty and not confirm_quit:
-                msg = "unsaved curve: s save · Q quit anyway"
-                confirm_quit = True
-                continue
-            break
-        if key == ord("Q"):
-            break
-        if key == ord("s"):
-            err = save_curve_file()
-            if err:
-                msg = err
-            else:
-                dirty = confirm_quit = False
-                msg = "saved; the daemon reloads within 1 s"
-            continue
-        if key == ord("r"):
-            FANS[fan]["thr"] = [tuple(x) for x in DEFAULT_THR[fan]]
-            row = col = 0
-            dirty = True
-            confirm_quit = False
-            msg = "reset to the embedded defaults (s to save)"
-            continue
-        if key in (ord("1"), ord("2")):
-            fan = key - ord("1")
-            row = col = 0
-            msg = FANS[fan]["name"]
-            continue
-        if key == curses.KEY_UP:
-            row = max(0, row - 1)
-        elif key == curses.KEY_DOWN:
-            row = min(len(thr) - 1, row + 1)
-        elif key == 9:                     # Tab
-            col = (col + 1) % 3
-        elif key == curses.KEY_BTAB:
-            col = (col - 1) % 3
-        elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
-            bump(-1 if key == curses.KEY_LEFT else 1)
-        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
-            bump(-5 if key == curses.KEY_PPAGE else 5)
-    if rig is not None:
-        rig.close()
-    return 0
+    next_read = 0.0
+    try:
+        while True:
+            if time.monotonic() >= next_read:
+                next_read = time.monotonic() + SAMPLE_EVERY
+                canvas.follow_theme()
+                if rig is not None:
+                    try:
+                        cpu, gpu, _ = rig.temps()
+                    except OSError:
+                        cpu = gpu = None
+            h, w = canvas.begin()
+            editor.draw(canvas, h, w, cpu, gpu)
+            stdscr.refresh()
+            stdscr.timeout(max(1, int((next_read - time.monotonic()) * 1000)))
+            key = stdscr.getch()
+            if key != -1 and editor.handle(key):
+                return 0
+    finally:
+        if rig is not None:
+            rig.close()
 
 
 def cmd_curve(args):
     import curses
     if not sys.stdout.isatty():
         sys.exit("omenctl curve needs a terminal")
+    use_direct_color()
     try:
         return curses.wrapper(curve_main, args.fan) or 0
     except KeyboardInterrupt:
         return 0
+    finally:
+        sys.stdout.write("\x1b[?1002l")
+        sys.stdout.flush()
 
 
 def cmd_tui(args):
     import curses
     if not sys.stdout.isatty():
         sys.exit("omenctl tui needs a terminal")
+    use_direct_color()
     try:
         return curses.wrapper(tui_main, args) or 0
     except KeyboardInterrupt:
@@ -1526,7 +2188,6 @@ PROFILES = {
         "wifi_ps": "on", "igpu_dpm": "low",   # ~-3 W idle, costs CPU memory bandwidth
     },
 }
-DGPU = "/sys/bus/pci/devices/0000:01:00.0/driver"
 BOOT_SEEN = "/run/omenctl.boot-seen"
 BOOST = "/sys/devices/system/cpu/cpufreq/boost"
 MODE_FILE = "/var/lib/omenctl/mode"       # the user's choice: auto|quiet|eco|perf
@@ -1589,39 +2250,137 @@ def igpu_dpm_path():
 def nvidia_ready():
     """Gate on the PCI binding symlink: when nvidia does not own the dGPU
     (vfio-pci, D3cold) every nvidia-smi call costs ~0.8 s and fails."""
-    try:
-        return os.path.basename(os.readlink(DGPU)) == "nvidia"
-    except OSError:
-        return False
+    return dgpu_driver() == "nvidia"
+
+
+RYZENADJ_TO_PM = {
+    # ryzenadj argument -> (PM-table field, unit scale)
+    "--stapm-limit": ("STAPM LIMIT", 0.001),
+    "--fast-limit": ("PPT LIMIT FAST", 0.001),
+    "--slow-limit": ("PPT LIMIT SLOW", 0.001),
+    "--apu-slow-limit": ("PPT LIMIT APU", 0.001),
+    "--tctl-temp": ("THM LIMIT CORE", 1.0),   # degrees C, not mW
+}
+
+
+def expected_limits(p):
+    """The PM-table values a profile's ryzenadj arguments should produce (W)."""
+    want = {}
+    for arg in p["ryzenadj"]:
+        key, _, value = arg.partition("=")
+        entry = RYZENADJ_TO_PM.get(key)
+        if entry and value.isdigit():
+            pm, scale = entry
+            want[pm] = int(value) * scale
+    return want
+
+
+def verify_profile(name, boost, iface):
+    """Read back what apply_profile just wrote: [] means it took.
+
+    This is the repo's own rule applied to the tool: 'applied' is not 'took'.
+    The tolerance covers the SMU's float rounding (~1 W).
+    """
+    p = PROFILES[name]
+    problems = []
+
+    got = pm_limit_values()
+    if got:
+        for key, value in expected_limits(p).items():
+            if key not in got or abs(got[key] - value) > 1.5:
+                unit = "C" if key == "THM LIMIT CORE" else "W"
+                problems.append("%s %s != %g %s" % (
+                    key, got.get(key, "?"), value, unit))
+    else:
+        problems.append("PM table unreadable")
+
+    cpu0 = "/sys/devices/system/cpu/cpu0/cpufreq/"
+    gov = sysfs(cpu0 + "scaling_governor")
+    if gov != p["gov"]:
+        problems.append("governor %s != %s" % (gov, p["gov"]))
+    fmax = read_int(cpu0 + "scaling_max_freq")
+    allowed = [p["fmax"]]
+    if not boost:
+        # boost off clamps scaling_max_freq (and cpuinfo_max_freq) back to the
+        # base clock; that is the intended state, not a failed write.
+        clamped = read_int(cpu0 + "cpuinfo_max_freq")
+        if clamped:
+            allowed.append(clamped)
+    if fmax is None or min(abs(fmax - v) for v in allowed) > 1000:
+        problems.append("max_freq %s != %s" % (
+            fmax, " or ".join(str(v) for v in allowed)))
+    epp = sysfs(cpu0 + "energy_performance_preference")
+    if epp != p["epp"]:
+        problems.append("epp %s != %s" % (epp, p["epp"]))
+    want_boost = "1" if boost else "0"
+    if sysfs(BOOST) != want_boost:
+        problems.append("boost %s != %s" % (sysfs(BOOST), want_boost))
+
+    path = igpu_dpm_path()
+    if path and sysfs(path) != p["igpu_dpm"]:
+        problems.append("igpu_dpm %s != %s" % (sysfs(path), p["igpu_dpm"]))
+
+    if iface:
+        state = wifi_ps_state(iface)
+        if state != p["wifi_ps"]:
+            problems.append("wifi_ps %s != %s" % (state, p["wifi_ps"]))
+    return problems
 
 
 def apply_profile(name, ops, boost=True):
+    """Apply a profile, then prove it took; retry once on a mismatch."""
     p = PROFILES[name]
     plog("%s profile" % name.upper())
-    # boost first, so the freq cap below is not clamped under it
-    ops.write(BOOST, "1" if boost else "0")
-    for f, v in (("scaling_governor", p["gov"]), ("scaling_max_freq", p["fmax"]),
-                 ("energy_performance_preference", p["epp"])):
-        paths = glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/" + f)
+    iface = wifi_iface()
+    problems = []
+    for attempt in (1, 2):
+        # boost first, so the freq cap below is not clamped under it
+        ops.write(BOOST, "1" if boost else "0")
+        for f, v in (("scaling_governor", p["gov"]),
+                     ("scaling_max_freq", p["fmax"]),
+                     ("energy_performance_preference", p["epp"])):
+            paths = glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/" + f)
+            if ops.dry:
+                ops.write("cpu*/cpufreq/" + f, v)
+            else:
+                for path in paths:
+                    ops.write(path, v)
+        if ops.run(["/usr/bin/ryzenadj"] + p["ryzenadj"]) != 0:
+            plog("WARN: ryzenadj %s failed" % name)
+        if nvidia_ready():
+            for args in p["nvidia"]:
+                if ops.run(["nvidia-smi"] + args) != 0 and not ops.dry:
+                    plog("WARN: nvidia-smi %s failed" % " ".join(args))
+        if iface:
+            if ops.run(["iw", "dev", iface, "set", "power_save", p["wifi_ps"]]) != 0 \
+                    and not ops.dry:
+                plog("WARN: iw power_save failed on %s" % iface)
+        elif not ops.dry:
+            plog("WARN: no wireless interface; wifi power save not set")
+        path = igpu_dpm_path()
+        if path is None:
+            plog("WARN: no amdgpu DPM node found")
+        elif ops.dry or sysfs(path) != p["igpu_dpm"]:   # already there: no log spam
+            if ops.write(path, p["igpu_dpm"]):
+                plog("iGPU DPM level -> %s" % p["igpu_dpm"])
+
         if ops.dry:
-            ops.write("cpu*/cpufreq/" + f, v)
-        else:
-            for path in paths:
-                ops.write(path, v)
-    if ops.run(["/usr/bin/ryzenadj"] + p["ryzenadj"]) != 0:
-        plog("WARN: ryzenadj %s failed" % name)
-    if nvidia_ready():
-        for args in p["nvidia"]:
-            ops.run(["nvidia-smi"] + args)
-    ops.run(["iw", "dev", "wlan0", "set", "power_save", p["wifi_ps"]])
-    path = igpu_dpm_path()
-    if path is None:
-        plog("WARN: no amdgpu DPM node found")
-    elif ops.dry or sysfs(path) != p["igpu_dpm"]:   # already there: no log spam
-        if ops.write(path, p["igpu_dpm"]):
-            plog("iGPU DPM level -> %s" % p["igpu_dpm"])
+            break
+        problems = verify_profile(name, boost, iface)
+        if not problems:
+            break
+        if attempt == 1:
+            plog("WARN: %s not fully applied (%s); retrying once"
+                 % (name, "; ".join(problems)))
+
     print(">>> %s: %s" % (name.upper(), p["label"]))
-    plog("OK %s: %s" % (name.upper(), p["label"]))
+    if problems:
+        plog("WARN: %s verify failed: %s" % (name, "; ".join(problems)))
+        print("!!! %s: not fully applied (%s)"
+              % (name.upper(), "; ".join(problems)))
+    else:
+        plog("OK %s: %s" % (name.upper(), p["label"]))
+    return not problems
 
 
 def write_mode(mode):
@@ -1648,18 +2407,19 @@ def read_mode():
 
 
 def source_profile():
-    return "ac" if sysfs("/sys/class/power_supply/ACAD/online", "0") == "1" else "battery"
+    ac = power_supply("Mains") or "/sys/class/power_supply/ACAD"
+    return "ac" if sysfs(ac + "/online", "0") == "1" else "battery"
 
 
 def apply_mode(mode, ops):
     """auto = the envelope of the power source; quiet = auto with boost off;
-    eco = the battery envelope whatever the source; perf = everything unlocked."""
+    eco = the battery envelope whatever the source; perf = everything unlocked.
+    Returns True when the read-back matched (or the run was a dry run)."""
     if mode == "perf":
-        apply_profile("perf", ops)
+        return apply_profile("perf", ops)
     elif mode == "eco":
-        apply_profile("battery", ops)
-    else:
-        apply_profile(source_profile(), ops, boost=(mode != "quiet"))
+        return apply_profile("battery", ops)
+    return apply_profile(source_profile(), ops, boost=(mode != "quiet"))
 
 
 def log_boot_limits():
@@ -1681,7 +2441,9 @@ def cmd_boost(args):
     """CPU boost is part of the mode: off = quiet, on = auto. It only matters in
     those two (perf needs it on, eco's 2.4 GHz cap is below the base clock)."""
     mode = read_mode()
+    want_boost = None
     if args.state in ("on", "off"):
+        want_boost = args.state == "on"
         want = "quiet" if args.state == "off" else "auto"
         if mode in ("auto", "quiet"):
             if mode != want:
@@ -1693,10 +2455,11 @@ def cmd_boost(args):
             return 1
         mode = read_mode()
     fmax = read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    actual = sysfs(BOOST) == "1"
     print("boost %s (mode: %s) · max %s GHz"
-          % ("on" if sysfs(BOOST) == "1" else "off", mode,
+          % ("on" if actual else "off", mode,
              "%.2f" % (fmax / 1e6) if fmax else "?"))
-    return 0
+    return 0 if want_boost is None or actual == want_boost else 1
 
 
 PROFILE_HELP = """\
@@ -1729,11 +2492,12 @@ def apply_stored_mode(ops, quiet_if_recent=0.0):
         except OSError:
             age = 1e9
         if age < quiet_if_recent:
-            return False
+            return None
         log_boot_limits()
-        apply_mode(read_mode(), ops)
-        open(LAST_APPLY, "w").close()
-    return True
+        ok = apply_mode(read_mode(), ops)
+        if ok is not False:            # a failed apply must not debounce the retry
+            open(LAST_APPLY, "w").close()
+    return ok
 
 
 def set_mode(mode, ops):
@@ -1742,8 +2506,10 @@ def set_mode(mode, ops):
     log_boot_limits()
     with open(APPLY_LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        apply_mode(mode, ops)
-        open(LAST_APPLY, "w").close()
+        ok = apply_mode(mode, ops)
+        if ok is not False:
+            open(LAST_APPLY, "w").close()
+    return ok
 
 
 def cmd_profile(args):
@@ -1757,17 +2523,17 @@ def cmd_profile(args):
     ops = Ops(args.dry_run)
     mode = args.mode
     if mode == "guard":
-        apply_stored_mode(ops, quiet_if_recent=2.0)
-        return 0
+        ok = apply_stored_mode(ops, quiet_if_recent=2.0)
+        return 0 if ok is not False else 1
     if not ops.dry:
-        set_mode(mode, ops)
+        ok = set_mode(mode, ops)
     else:
-        apply_mode(mode, ops)
+        ok = apply_mode(mode, ops)
     print({"auto": ">>> AUTO: follows the power source",
            "quiet": ">>> QUIET: auto with boost off (the power cap does the cooling)",
            "eco": ">>> ECO: battery envelope kept on AC",
            "perf": ">>> PERF: unlocked, stays until another mode is chosen"}[mode])
-    return 0
+    return 0 if ok else 1
 
 
 # ------------------------------------------------------------------ watch --
@@ -1810,6 +2576,18 @@ def drain(fd):
         pass
 
 
+def target_pm_limits():
+    """The PM-table tuple the stored mode should produce (for the watcher)."""
+    mode = read_mode()
+    name = ("perf" if mode == "perf" else
+            "battery" if mode == "eco" else source_profile())
+    want = expected_limits(PROFILES[name])
+    keys = ("STAPM LIMIT", "PPT LIMIT FAST", "PPT LIMIT SLOW", "THM LIMIT CORE")
+    if not all(k in want for k in keys):
+        return None
+    return tuple(round(want[k], 1) for k in keys)
+
+
 def cmd_watch(_args):
     import ctypes
     import ctypes.util
@@ -1828,24 +2606,30 @@ def cmd_watch(_args):
     last = [0.0]
 
     def reapply(reason):
+        """True = refresh `known`; False = the apply failed, keep the target."""
         if time.monotonic() - last[0] < WATCH_MIN_INTERVAL:
-            return False
+            return True                # debounced: another apply just ran
         last[0] = t0 = time.monotonic()
         try:
             done = apply_stored_mode(Ops(False), quiet_if_recent=1.0)
-            print("re-applied after %s in %.2fs" % (reason, time.monotonic() - t0)
-                  if done else "skipped after %s: another apply just ran" % reason,
+            elapsed = time.monotonic() - t0
+            if done is None:
+                print("skipped after %s: another apply just ran" % reason, flush=True)
+                return True
+            print(("re-applied after %s in %.2fs" if done else
+                   "FAILED to apply after %s in %.2fs") % (reason, elapsed),
                   flush=True)
+            return done
         except OSError as e:
             print("FAILED to re-apply after %s: %s" % (reason, e), flush=True)
-        return True
+            return False
 
     print("watching %s and the SMU limits (now %s)"
           % (PLATFORM_PROFILE, describe(pm_limits())), flush=True)
     # Known-good state first: a watcher started while the limits are already off
     # target would otherwise adopt the wrong values and never correct them.
-    reapply("startup")
-    known = pm_limits()
+    startup_ok = reapply("startup")
+    known = pm_limits() if startup_ok else target_pm_limits()
     print("baseline after startup apply: %s" % describe(known), flush=True)
     while not stop:
         r, _, _ = select.select([fd], [], [], WATCH_POLL)
@@ -1853,8 +2637,8 @@ def cmd_watch(_args):
             drain(fd)
             time.sleep(WATCH_DEBOUNCE)
             drain(fd)
-            reapply("platform_profile -> %r" % sysfs(PLATFORM_PROFILE, "?"))
-            known = pm_limits()
+            if reapply("platform_profile -> %r" % sysfs(PLATFORM_PROFILE, "?")):
+                known = pm_limits()
             continue
         cur = pm_limits()                                 # 2. silent drift
         if cur is not None and known is not None and cur != known:
@@ -1966,15 +2750,25 @@ def cmd_run(args):
     return cmd_reset(args)
 
 
+def model_info():
+    root = os.environ.get("OMENCTL_DMI_DIR", "/sys/class/dmi/id")
+    return (sysfs(root + "/product_name", ""),
+            sysfs(root + "/board_name", ""))
+
+
+def model_supported():
+    product, board = model_info()
+    return (product.startswith(SUPPORTED_PRODUCT) and board in SUPPORTED_BOARDS,
+            product, board)
+
+
 def check_model():
     """Refuse to touch the EC on hardware this was not measured on.
 
     OMENCTL_DMI_DIR only exists so the refusal can be tested without such a
     machine; it is not a way around the check."""
-    root = os.environ.get("OMENCTL_DMI_DIR", "/sys/class/dmi/id")
-    product = sysfs(root + "/product_name", "")
-    board = sysfs(root + "/board_name", "")
-    if product.startswith(SUPPORTED_PRODUCT) and board in SUPPORTED_BOARDS:
+    ok, product, board = model_supported()
+    if ok:
         return
     sys.exit(
         "omenctl: refusing to run. It writes embedded-controller registers whose "
@@ -1987,6 +2781,177 @@ def check_model():
            SUPPORTED_PRODUCT))
 
 
+def cmd_doctor(_args):
+    """Read-only self-check: model, EC, SMU, dGPU, WiFi, units, fans.
+
+    Exit 1 on a FAIL; warnings do not fail. It never writes the EC, the SMU or
+    an EFI variable -- the one exception is opening the EC O_RDWR to prove the
+    daemon will be able to. Nothing is written through that descriptor.
+    """
+    import shutil
+    fails = warns = 0
+
+    def line(tag, label, detail=""):
+        nonlocal fails, warns
+        if tag == "FAIL":
+            fails += 1
+        elif tag == "WARN":
+            warns += 1
+        print("[%s] %-18s %s" % (tag, label, detail))
+
+    ok, product, board = model_supported()
+    line("OK" if ok else "FAIL", "model", "%s / %s" % (product or "?", board or "?"))
+    bios = sysfs("/sys/class/dmi/id/bios_version", "?")
+    line("OK" if bios != "?" else "WARN", "bios", bios)
+
+    param = sysfs("/sys/module/ec_sys/parameters/write_support")
+    if param is None:
+        line("FAIL", "ec_sys", "not loaded (modprobe ec_sys write_support=1)")
+    elif param != "Y":
+        line("FAIL", "ec_sys", "write_support=%s (need Y)" % param)
+    else:
+        line("OK", "ec_sys", "write_support=Y")
+    try:
+        fd = os.open(ECIO, os.O_RDONLY)
+        try:
+            temp = os.pread(fd, 1, CPU_TEMP)[0]
+        finally:
+            os.close(fd)
+        line("OK", "EC read", "0x%02X = %d C" % (CPU_TEMP, temp))
+    except (OSError, IndexError) as e:
+        line("FAIL", "EC read", str(e))
+    try:
+        fd = os.open(ECIO, os.O_RDWR)
+        os.close(fd)
+        line("OK", "EC write", "O_RDWR accepted")
+    except OSError as e:
+        line("FAIL", "EC write", str(e))
+
+    lim = pm_limit_values()
+    if lim:
+        line("OK", "ryzen_smu", "STAPM %g W / Tctl %g C" % (
+            lim.get("STAPM LIMIT", 0), lim.get("THM LIMIT CORE", 0)))
+    else:
+        line("FAIL", "ryzen_smu", "PM table unreadable (%s)" % PM_TABLE)
+
+    if os.access("/usr/bin/ryzenadj", os.X_OK):
+        line("OK", "ryzenadj", "/usr/bin/ryzenadj")
+    else:
+        found = shutil.which("ryzenadj")
+        if found:
+            line("WARN", "ryzenadj", "%s, but apply_profile uses /usr/bin/ryzenadj" % found)
+        else:
+            line("FAIL", "ryzenadj", "missing (the SMU limits cannot be written)")
+
+    pci = dgpu_pci()
+    if not pci:
+        line("WARN", "dGPU", "no NVIDIA VGA/3D function found")
+    else:
+        drv = dgpu_driver()
+        if drv == "nvidia":
+            smi = shutil.which("nvidia-smi")
+            line("OK" if smi else "WARN", "dGPU",
+                 "%s: nvidia%s" % (pci, "" if smi else " (nvidia-smi missing)"))
+        elif drv == "vfio-pci":
+            line("OK", "dGPU", "%s: vfio-pci (D3cold, ~6.7 W saved)" % pci)
+        else:
+            line("WARN", "dGPU", "%s: %s" % (pci, drv or "no driver"))
+
+    iface = wifi_iface()
+    if not iface:
+        line("WARN", "wifi", "no wireless interface")
+    elif not shutil.which("iw"):
+        line("WARN", "wifi", "%s: iw missing (power_save not applied)" % iface)
+    else:
+        line("OK", "wifi", "%s: power_save=%s" % (iface, wifi_ps_state(iface) or "?"))
+
+    mains = power_supply("Mains")
+    bat = power_supply("Battery")
+    line("OK" if mains else "WARN", "AC",
+         "%s: online=%s" % (mains, sysfs(mains + "/online", "?")) if mains
+         else "no Mains power_supply")
+    line("OK" if bat else "WARN", "battery",
+         "%s: %s%% %s" % (bat, read_int(bat + "/capacity"), sysfs(bat + "/status"))
+         if bat else "no Battery power_supply")
+
+    profile = sysfs("/sys/firmware/acpi/platform_profile")
+    line("OK" if profile else "WARN", "platform_profile", profile or "not exposed")
+
+    if not os.path.exists(CURVE_FILE):
+        line("OK", "fan curve", "embedded defaults (%s absent)" % CURVE_FILE)
+    else:
+        try:
+            with open(CURVE_FILE) as f:
+                data = json.load(f)
+            errs = []
+            for key in ("cpu", "gpu"):
+                thr = [(int(a), int(b), int(c)) for a, b, c in data[key]]
+                err = curve_error(thr)
+                if err:
+                    errs.append("%s: %s" % (key, err))
+            line("FAIL" if errs else "OK", "fan curve", "; ".join(errs) or CURVE_FILE)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            line("FAIL", "fan curve", "invalid %s: %s" % (CURVE_FILE, e))
+
+    def systemctl(*argv):
+        try:
+            return subprocess.run(["systemctl"] + list(argv), stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True,
+                                  timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return "?"
+
+    for unit, wanted in (("omenctl.service", ("enabled", "active")),
+                         ("omenctl-watch.service", ("enabled", "active")),
+                         ("omenctl-profile.timer", ("enabled", "active"))):
+        enabled = systemctl("is-enabled", unit)
+        active = systemctl("is-active", unit)
+        line("OK" if (enabled, active) == wanted else "WARN", unit,
+             "enabled=%s active=%s" % (enabled, active))
+    prof = systemctl("is-enabled", "omenctl-profile.service")
+    line("OK" if prof == "enabled" else "WARN", "omenctl-profile.service", prof)
+    nbfc = systemctl("is-enabled", "nbfc_service") or "not-found"
+    line("OK" if nbfc in ("disabled", "not-found") else "WARN", "nbfc_service", nbfc)
+    ppd = systemctl("is-enabled", "power-profiles-daemon") or "not-found"
+    line("OK" if ppd in ("masked", "disabled", "not-found") else "WARN",
+         "power-profiles-daemon", ppd)
+
+    running = daemon_running()
+    line("OK" if running else "WARN", "fan daemon",
+         "running" if running else "not running")
+    try:
+        rig = Rig(0)
+        try:
+            cpu, gpu, regs = rig.temps()
+            rpms = [read_int(rig.hp + "/fan%d_input" % i) if rig.hp else None
+                    for i in (1, 2)]
+            cduty = "EC" if regs[0] == RESET_VALUE else "%d%%" % regs[0]
+            gduty = "EC" if regs[1] == RESET_VALUE else "%d%%" % regs[1]
+            line("OK", "fans", "CPU %.0fC %s %s rpm | GPU %.0fC %s %s rpm" % (
+                cpu, cduty, rpms[0] if rpms[0] is not None else "?",
+                gpu, gduty, rpms[1] if rpms[1] is not None else "?"))
+            for name, setp, rpm in (("cpu", regs[0], rpms[0]),
+                                    ("gpu", regs[1], rpms[1])):
+                if setp != RESET_VALUE and setp >= 30 and not rpm:
+                    line("WARN", "fan %s" % name,
+                         "setpoint %d%% but rpm=%s (stall?)" % (setp, rpm))
+            cap = battery_capacity(rig)
+            if cap:
+                line("OK", "battery health", "%.1f / %.1f Wh (%.0f%%)" % (
+                    cap[1], cap[0], 100.0 * cap[1] / cap[0]))
+            abe = battery_extender(rig)
+            line("OK" if abe is not None else "WARN", "battery extender",
+                 "on" if abe else "off" if abe is not None else "unreadable")
+        finally:
+            rig.close()
+    except OSError as e:
+        line("WARN", "fans", "EC read failed: %s" % e)
+
+    print()
+    print("doctor: %d failure(s), %d warning(s)" % (fails, warns))
+    return 1 if fails else 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="omenctl",
@@ -1994,6 +2959,9 @@ def main():
                     "top of omenctl.py and ../ec-map.md).")
     sub = ap.add_subparsers(dest="cmd", required=True, title="commands",
                             metavar="COMMAND")
+    p = sub.add_parser("doctor", help="read-only self-check: model, EC, SMU, dGPU, WiFi, units")
+    p.set_defaults(func=cmd_doctor)
+
     p = sub.add_parser("status", help="fans, power, battery (-w: live view)")
     p.add_argument("-w", "--watch", action="store_true",
                    help="refresh every second until Ctrl-C")
@@ -2044,7 +3012,8 @@ def main():
     p.set_defaults(func=cmd_reset)
 
     args = ap.parse_args()
-    check_model()
+    if args.cmd != "doctor":       # the doctor reports the model instead of exiting
+        check_model()
     if os.geteuid() != 0:
         sys.exit("root needed for the EC io file")
     return args.func(args) or 0
