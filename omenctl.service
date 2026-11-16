@@ -10,8 +10,8 @@
 # ~50 % at 65 C). Restart=no is deliberate: a failed governor falls back to
 # the EC and stays there.
 #
-# Conflicts= keeps nbfc_service (no longer needed, may still be installed) from
-# ever running as a second writer.
+# Conflicts= keeps a leftover nbfc_service (not installed on this machine
+# anymore) from ever running as a second writer.
 
 [Unit]
 Description=Omenctl (fan governor)

@@ -2671,7 +2671,7 @@ def cmd_run(args):
     idx = {f["write_reg"]: initial_index(f["thr"], regs[f["write_reg"] - SET_CPU + 2])
            for f in fans}
     notified = False
-    read_fails = write_fails = 0
+    read_fails = write_fails = failsafe_fails = 0
     try:
         os.unlink(FAN_OVERRIDE)               # a fresh start is always on the curve
     except OSError:
@@ -2682,7 +2682,7 @@ def cmd_run(args):
     while not stop:
         try:
             cpu, gpu, regs = rig.temps()
-            read_fails = 0
+            read_fails = failsafe_fails = 0
         except OSError as e:
             read_fails += 1
             print("read failed (%d): %s" % (read_fails, e), flush=True)
@@ -2691,11 +2691,21 @@ def cmd_run(args):
             except OSError:
                 pass
             if read_fails >= 3:                    # fail safe: full speed
+                failed = 0
                 for f in fans:
                     try:
                         rig.ec_write(f["write_reg"], 100)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        failed += 1
+                        print("fail-safe write failed: %s" % e, flush=True)
+                if failed:
+                    failsafe_fails += 1
+                    if failsafe_fails >= 5:
+                        print("giving up; EC unavailable, unit stop path will reset",
+                              flush=True)
+                        return 1
+                else:
+                    failsafe_fails = 0
             time.sleep(1)
             continue
 
@@ -2760,6 +2770,14 @@ def model_supported():
     product, board = model_info()
     return (product.startswith(SUPPORTED_PRODUCT) and board in SUPPORTED_BOARDS,
             product, board)
+
+
+def model_check_required(args):
+    """`reset --raw` is the emergency latch release: it must write the 255s even
+    when the DMI is unreadable (e.g. after a flash experiment). Every other
+    command keeps the model gate."""
+    return args.cmd != "doctor" and not (
+        args.cmd == "reset" and getattr(args, "raw", False))
 
 
 def check_model():
@@ -3012,7 +3030,7 @@ def main():
     p.set_defaults(func=cmd_reset)
 
     args = ap.parse_args()
-    if args.cmd != "doctor":       # the doctor reports the model instead of exiting
+    if model_check_required(args):  # the doctor reports the model; reset --raw is the release
         check_model()
     if os.geteuid() != 0:
         sys.exit("root needed for the EC io file")

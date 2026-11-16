@@ -117,11 +117,22 @@ def stored_mode_test():
     print("PASS  failed apply does not debounce; a recent success does")
 
 
+def model_gate_test():
+    """The emergency latch release is the one command that must not be gated."""
+    from types import SimpleNamespace
+    assert oc.model_check_required(SimpleNamespace(cmd="run", raw=False))
+    assert oc.model_check_required(SimpleNamespace(cmd="reset", raw=False))
+    assert not oc.model_check_required(SimpleNamespace(cmd="reset", raw=True))
+    assert not oc.model_check_required(SimpleNamespace(cmd="doctor"))
+    print("PASS  model gate: reset --raw is the one ungated path")
+
+
 def main():
     expected_test()
     verify_test()
     target_test()
     stored_mode_test()
+    model_gate_test()
     return 0
 
 
