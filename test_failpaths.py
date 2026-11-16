@@ -117,6 +117,10 @@ def main():
     rc, w, r, out = run(lambda n: ("ok", 75, 60), 20, fail_writes=True)
     ok.append(check("5 EC write failures: gives up with rc=1",
                     rc == 1 and "giving up" in out and out.count("write failed") == 5))
+    rc, w, r, out = run(lambda n: ("readfail",), 8, fail_writes=True)
+    ok.append(check("EC gone: failed fail-safe writes give up too",
+                    rc == 1 and "giving up" in out
+                    and out.count("fail-safe write failed") >= 5, str(w)))
     rc, w, r, out = run(lambda n: ("ok", 75, 60), 5)
     ok.append(check("steady 75/60 C: curve written once per fan, not every tick",
                     w == [(CPU, 28), (GPU, 16)], str(w)))
